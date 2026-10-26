@@ -1,0 +1,15 @@
+.tooling/
+.local/
+**/bin/
+**/obj/
+*.user
+*.partial
+*.log
+*.tmp
+*.pyc
+__pycache__/
+.vs/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,57 @@
+<!doctype html>
+<meta charset="utf-8">
+<label>图标<input type="file" name="iconFile" data-icon-picker accept="image/png"><img class="icon-upload-preview" hidden><span class="icon-result"></span></label>
+<dialog id="iconCropDialog">
+  <button type="button" id="iconCropCancel">取消</button>
+  <canvas id="iconCropCanvas" width="256" height="256"></canvas>
+  <canvas id="iconCropPreview" width="96" height="96"></canvas>
+  <input id="iconCropZoom" type="range" min="1" max="3" value="1" step="0.01">
+  <p id="iconCropStatus"></p>
+  <button type="button" id="iconCropConfirm">使用这个裁剪</button>
+</dialog>
+<script src="../server/Ui/app.js" defer></script>
+<script>
+window.addEventListener('load', async () => {
+  window.alert = message => { document.body.dataset.alert = message; };
+  const wait = async check => {
+    for (let i = 0; i < 100; i++) {
+      if (check()) return;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    throw new Error('Timed out waiting for crop conversion.');
+  };
+  try {
+    const source = document.createElement('canvas');
+    source.width = 800;
+    source.height = 400;
+    const context = source.getContext('2d');
+    const fill = context.createLinearGradient(0, 0, 800, 400);
+    fill.addColorStop(0, '#ff8050');
+    fill.addColorStop(1, '#3355ff');
+    context.fillStyle = fill;
+    context.fillRect(0, 0, 800, 400);
+    const blob = await new Promise(resolve => source.toBlob(resolve, 'image/jpeg', .9));
+    const chosen = document.querySelector('[data-icon-picker]');
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([blob], 'photo.jpg', {type: 'image/jpeg'}));
+    chosen.files = transfer.files;
+    chosen.dispatchEvent(new Event('change'));
+    document.body.dataset.step = 'selected';
+    await wait(() => document.getElementById('iconCropDialog').open);
+    document.body.dataset.step = 'dialog';
+    const zoom = document.getElementById('iconCropZoom');
+    zoom.value = '1.5';
+    zoom.dispatchEvent(new Event('input'));
+    document.getElementById('iconCropConfirm').click();
+    document.body.dataset.step = 'confirm';
+    await wait(() => !document.getElementById('iconCropDialog').open);
+    const result = chosen.files[0];
+    if (result?.type !== 'image/png' || result.size > 128 * 1024 ||
+        !document.querySelector('.icon-upload-preview').src.startsWith('blob:'))
+      throw new Error('Converted icon does not meet launcher limits.');
+    document.body.dataset.result = 'PASS';
+  } catch (error) {
+    document.body.dataset.result = 'FAIL: ' + error.message;
+  }
+});
+</script>

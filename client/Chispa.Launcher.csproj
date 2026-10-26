@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationIcon>../assets/branding/chispa.ico</ApplicationIcon>
+    <ChispaServerUrl Condition="'$(ChispaServerUrl)' == ''">http://127.0.0.1:5115</ChispaServerUrl>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="../assets/branding/chispa.ico" LogicalName="Chispa.Brand.chispa.ico" />
+    <EmbeddedResource Include="../assets/branding/chispa.png" LogicalName="Chispa.Brand.chispa.png" />
+    <EmbeddedResource Include="../assets/branding/chispa-mark.png" LogicalName="Chispa.Brand.chispa-mark.png" />
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>ChispaServerUrl</_Parameter1>
+      <_Parameter2>$(ChispaServerUrl)</_Parameter2>
+    </AssemblyAttribute>
+  </ItemGroup>
+</Project>

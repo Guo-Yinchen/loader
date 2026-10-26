@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Ui/style.css" LogicalName="Chispa.Admin.style.css" />
+    <EmbeddedResource Include="Ui/app.js" LogicalName="Chispa.Admin.app.js" />
+    <EmbeddedResource Include="../assets/branding/chispa.svg" LogicalName="Chispa.Admin.chispa.svg" />
+  </ItemGroup>
+</Project>
