@@ -4,7 +4,8 @@
 
 .DESCRIPTION
     production (default) reads release/release.json, requires a public HTTPS origin, builds into
-    a staging directory, verifies the finished EXE by running it, then swaps it into the
+    a staging directory, verifies the finished EXE (or reads its bundle when elevation is
+    required), then swaps it into the
     distribution folder. The previous artifact is kept next to it as "<output>.previous".
 
     local builds a loopback-only client into .local/distribution/client-local for local testing.
@@ -21,7 +22,7 @@
 
 .PARAMETER OutputDirectory
     Build target. Relative paths resolve against the repository root.
-    Defaults: .local/distribution/client (production), .local/distribution/client-local (local).
+    Defaults: dist/client (production), .local/distribution/client-local (local).
 
 .PARAMETER ConfigPath
     Release configuration file. Defaults to release/release.json.
@@ -36,7 +37,7 @@
     ./publish-client.ps1 -Profile local
 
 .EXAMPLE
-    ./publish-client.ps1 -VerifyArtifact .local/distribution/client/Chispa.Launcher.exe
+    ./publish-client.ps1 -VerifyArtifact dist/client/Chispa.Launcher.exe
 #>
 [CmdletBinding()]
 param(

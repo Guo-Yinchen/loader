@@ -58,13 +58,13 @@
 ./publish-client.ps1
 ```
 
-默认就是**正式发布**：地址取自 `release/release.json` 的 `production` 档案（当前为 `https://teamviewer.rm7lwjwtg.nyat.app:24154`），不需要每次手工传地址。输出为 `.local/distribution/client/Chispa.Launcher.exe`，该目录中只有这一个文件，可直接复制给 Windows x64 用户；旁边的 `.local/distribution/client.manifest.json` 记录本次产物的地址、SHA-256、大小和构建时间。
+默认就是**正式发布**：地址取自 `release/release.json` 的 `production` 档案（当前为 `https://teamviewer.rm7lwjwtg.nyat.app:24154`），不需要每次手工传地址。输出为 `dist/client/Chispa.Launcher.exe`，该目录中只有这一个文件，可直接复制给 Windows x64 用户；旁边的 `dist/client.manifest.json` 记录本次产物的地址、SHA-256、大小和构建时间。
 
 打包流程内置三道保障：
 
 1. **地址校验**：正式档案必须是公网 HTTPS 站点根地址。回环地址（`127.0.0.1`/`localhost`/`[::1]`）、远程明文 HTTP、带路径/查询/锚点、带账号密码、无效端口、输出目录指向仓库根，都会在开始构建前直接失败。`-ServerUrl` 只是覆盖来源，同样不能绕开这些规则。
-2. **产物自检**：构建先写入暂存目录，然后**运行产出的 EXE**（`--print-server-url` / `--verify-server-url`）读出它真正内嵌的地址再比对，并用一个错误地址反向验证该检查确实会失败。压缩后的单文件无法只靠字符串搜索确认地址，因此以运行时读取为准；脚本仍会打印一次明文命中情况作为参考。
-3. **失败不动上一版**：只有构建和自检都通过，才会把暂存目录换成分发目录，旧产物保留在 `.local/distribution/client.previous/`；任何一步失败，分发目录逐字节保持不变。
+2. **产物自检**：构建先写入暂存目录，通常运行产出的 EXE（`--print-server-url` / `--verify-server-url`）检查真实内嵌地址；普通权限进程遇到管理员启动要求时，直接检查成品的权限清单及单文件包内程序集元数据。两种方式都会用错误地址做反向验证，不以明文字符串搜索或构建参数代替成品检查。
+3. **失败不动上一版**：只有构建和自检都通过，才会把暂存目录换成分发目录，旧产物保留在 `dist/client.previous/`；任何一步失败，分发目录逐字节保持不变。
 
 本机联调不要用正式档案，显式指定本地档案：
 
@@ -77,7 +77,7 @@
 复核已有产物（不重新构建）：
 
 ```powershell
-./publish-client.ps1 -VerifyArtifact .local/distribution/client/Chispa.Launcher.exe
+./publish-client.ps1 -VerifyArtifact dist/client/Chispa.Launcher.exe
 ```
 
 地址写入 EXE，无需旁边放 `launcher.json`。运行时 .NET 可能将内置的原生库临时解压到系统临时目录；下载的程序则存入用户的 `%LOCALAPPDATA%/Chispa`，不会散落在加载器 EXE 旁边。客户端的“测试连接”会请求这个内置地址；后台“客户端连接诊断”显示最近一次成功探测的时间和来源地址。后台的“测试当前浏览器连接”只检查浏览器所在电脑到服务器的链路。测试公网访问时，应在外网电脑使用内置正式 HTTPS 地址的客户端点击“测试连接”。
