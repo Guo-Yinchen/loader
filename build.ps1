@@ -18,4 +18,8 @@ $temporary = $pointer + '.tmp'
 [System.IO.File]::WriteAllText($temporary, $buildId)
 Move-Item -LiteralPath $temporary -Destination $pointer -Force
 & $dotnet build (Join-Path $root 'client/Chispa.Launcher.csproj') -c Release
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+# Packaging and signing happen in the release environment, but the tool is built here so that
+# publish-current.ps1 always runs the version of the format this checkout signs and verifies.
+& $dotnet build (Join-Path $root 'tools/Chispa.Sign/Chispa.Sign.csproj') -c Release
 exit $LASTEXITCODE

@@ -1,9 +1,10 @@
+﻿using System.Diagnostics;
 using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
 
 namespace Chispa.Launcher;
 
-internal sealed class LauncherForm : Form
+internal sealed partial class LauncherForm : Form
 {
     private readonly LauncherApi api;
     private readonly Installer installer;
@@ -13,18 +14,22 @@ internal sealed class LauncherForm : Form
     private readonly TextBox password = new();
     private readonly GlassCheck remember = new();
     private readonly FlowLayoutPanel programCards = new();
-    private readonly Label loginStatus = new();
-    private readonly Label libraryStatus = new();
-    private readonly Label programName = new();
-    private readonly Label version = new();
-    private readonly Label welcome = new();
-    private readonly Label catalogCount = new();
+    private readonly Label loginStatus = new GlassLabel();
+    private readonly Label libraryStatus = new GlassLabel();
+    private readonly Label programName = new GlassLabel();
+    private readonly Label version = new GlassLabel();
+    private readonly Label welcome = new GlassLabel();
+    private readonly Label accountTime = new GlassLabel();
+    private readonly Label accountExpiry = new GlassLabel();
+    private readonly Label catalogCount = new GlassLabel();
+    private readonly GlassCanvas windowSurface = new();
     private readonly GlassProgress progress = new();
     private readonly GlassButton logout = new();
     private readonly GlassCheck showPassword = new();
     private readonly CancellationTokenSource lifetime = new();
     private readonly GlassButton login = new();
-    private readonly GlassButton testConnection = new();
+    private readonly GlassButton registerAccount = new();
+    private readonly GlassButton redeemCode = new();
     private readonly GlassButton syncCatalog = new();
     private readonly GlassButton refresh = new();
     private readonly GlassButton install = new();
@@ -32,7 +37,11 @@ internal sealed class LauncherForm : Form
     private ProgramInfo? selected;
     private Release? latest;
     private bool busy;
+    private bool backgroundSync;
+    private bool displayedExpired;
+    private int sessionGeneration;
     private readonly System.Windows.Forms.Timer catalogTimer = new() { Interval = 60_000 };
+    private readonly System.Windows.Forms.Timer accountTimer = new() { Interval = 1_000 };
 
     private static readonly Color Background = GlassTheme.Background;
     private static readonly Color Accent = GlassTheme.Accent;
@@ -52,11 +61,12 @@ internal sealed class LauncherForm : Form
     {
         this.api = api;
         this.installer = installer;
+        SuspendLayout();
         Text = "Chispa Launcher";
         FormBorderStyle = FormBorderStyle.None;
         AutoScaleMode = AutoScaleMode.Dpi;
         AutoScaleDimensions = new SizeF(96, 96);
-        ClientSize = new Size(1040, 660);
+        ClientSize = new Size(1040, 696);
         Icon = GlassTheme.LoadIcon();
         DoubleBuffered = true;
         MinimumSize = MaximumSize = Size;
@@ -71,16 +81,32 @@ internal sealed class LauncherForm : Form
         libraryPage.Dock = DockStyle.Fill;
         libraryPage.BackColor = Background;
         libraryPage.Visible = false;
-        Controls.Add(libraryPage);
-        Controls.Add(loginPage);
-        ConfigureWindowChrome(loginPage);
-        ConfigureWindowChrome(libraryPage);
+        windowSurface.Name = "windowSurface";
+        windowSurface.Dock = DockStyle.Fill;
+        Controls.Add(windowSurface);
+        var pages = new GlassLayer { Size = new Size(1040, 660), Dock = DockStyle.Fill };
+        windowSurface.Controls.Add(pages);
+        loginPage.IsContentLayer = libraryPage.IsContentLayer = true;
+        loginPage.Size = libraryPage.Size = new Size(1040, 660);
+        pages.Controls.Add(libraryPage);
+        pages.Controls.Add(loginPage);
+        ConfigureWindowChrome();
 
         BuildLoginPage();
         BuildLibraryPage();
+        BuildRegistrationPage(pages);
+        accountTimer.Tick += (_, _) =>
+        {
+            UpdateAccountTime();
+            if (displayedExpired != api.AccountExpired)
+            {
+                displayedExpired = api.AccountExpired;
+                UpdateControls();
+            }
+        };
         catalogTimer.Tick += async (_, _) =>
         {
-            if (libraryPage.Visible && !busy) await RunBusy(() => RefreshCatalogAsync(silent: true));
+            if (libraryPage.Visible && !busy && !backgroundSync) await BackgroundSyncAsync();
         };
         var saved = CredentialStore.Load(api.ServerUrl);
         if (saved is not null)
@@ -93,6 +119,7 @@ internal sealed class LauncherForm : Form
         else SetStatus("输入账号密码后登录。");
         AcceptButton = login;
         UpdateControls();
+        ResumeLayout(performLayout: true);
     }
 
     private void BuildLoginPage()
@@ -102,10 +129,10 @@ internal sealed class LauncherForm : Form
         loginPage.Controls.Add(card);
         AddLabel(card, "YOUR NEXT SPARK", 32, 27, 9, Accent, true, 365);
         AddLabel(card, "欢迎回来", 29, 61, 27, Color.White, true, 365);
-        AddLabel(card, "登录 Chispa，打开你的专属程序库。", 32, 114, 10, Muted, false, 370);
+        AddLabel(card, "登录 Chispa，打开你的专属程序库。", 32, 126, 10, Muted, false, 370);
         AddLabel(card, "账号", 32, 164, 10, Muted, false, 300);
         ConfigureText(card, username, 32, 193, 370);
-        username.PlaceholderText = "输入账号";
+        username.PlaceholderText = "邮箱或后台创建的账号";
         AddLabel(card, "密码", 32, 256, 10, Muted, false, 300);
         ConfigureText(card, password, 32, 285, 370);
         password.PlaceholderText = "输入密码";
@@ -121,18 +148,33 @@ internal sealed class LauncherForm : Form
         card.Controls.Add(showPassword);
         ConfigureButton(card, login, "进入程序库   →", 32, 393, 370, true);
         login.Height = 48;
-        ConfigureButton(card, testConnection, "测试连接", 32, 452, 370, false);
+        ConfigureButton(card, registerAccount, "注册账户", 32, 452, 370, false);
         loginStatus.SetBounds(32, 508, 370, 45);
         loginStatus.ForeColor = Muted;
         loginStatus.BackColor = Color.Transparent;
         loginStatus.Font = new Font("Microsoft YaHei UI", 9);
         loginStatus.AccessibleName = "登录状态";
         card.Controls.Add(loginStatus);
+        // Update notice: the server says which loader build is current; the user decides whether to
+        // download it. Nothing is fetched or executed here - a validated https link is all that is
+        // ever offered, and only it opens when the text is clicked.
+        loginStatus.Cursor = Cursors.Default;
+        loginStatus.Click += (_, _) =>
+        {
+            if (launcherDownload is null) return;
+            try
+            {
+                Process.Start(new ProcessStartInfo(launcherDownload) { UseShellExecute = true });
+            }
+            catch (Exception ex) { try { File.AppendAllText(Path.Combine(Path.GetTempPath(), "chispa-launcher-error.log"), DateTimeOffset.Now + Environment.NewLine + ex + Environment.NewLine); } catch { } }
+        };
+        _ = CheckLauncherUpdateAsync();
         login.Click += async (_, _) => await RunBusy(async () =>
         {
             var account = username.Text.Trim();
             var secret = password.Text;
             await api.LoginAsync(account, secret, lifetime.Token);
+            sessionGeneration++;
             var programs = await api.GetProgramsAsync(lifetime.Token);
             string? saveError = null;
             try
@@ -142,13 +184,15 @@ internal sealed class LauncherForm : Form
             }
             catch (Exception ex) { saveError = ex.Message; }
             password.Clear();
-            welcome.Text = "欢迎，" + account;
+            welcome.Text = "欢迎，" + (api.Account?.Username ?? account);
+            UpdateAccountTime();
             loginPage.Visible = false;
             libraryPage.Visible = true;
             AcceptButton = null;
             LoadProgramCards(programs);
             catalogCount.Text = $"{programs.Count} 个已授权选项";
             catalogTimer.Start();
+            accountTimer.Start();
             if (programs.Count == 0)
                 SetStatus("暂无已授权的程序。");
             else
@@ -159,11 +203,29 @@ internal sealed class LauncherForm : Form
             }
             if (saveError is not null) SetStatus("登录成功，但无法保存登录信息：" + saveError);
         });
-        testConnection.Click += async (_, _) => await RunBusy(async () =>
+        registerAccount.Click += (_, _) => ShowRegistration();
+    }
+
+    private string? launcherDownload;
+
+    /// <summary>Compares this build with what the server says is current. A failure is silent: an
+    /// update hint must never get in the way of signing in.</summary>
+    private async Task CheckLauncherUpdateAsync()
+    {
+        var current = typeof(LauncherForm).Assembly.GetName().Version;
+        var latest = await api.GetLauncherLatestAsync(lifetime.Token);
+        if (latest is null || !Version.TryParse(latest.Version, out var serverVersion) || current is null) return;
+        if (serverVersion <= current) return;
+        launcherDownload = string.IsNullOrEmpty(latest.DownloadUrl) ? null : latest.DownloadUrl;
+        if (loginStatus.IsDisposed || lifetime.IsCancellationRequested) return;
+        loginStatus.BeginInvoke(() =>
         {
-            SetStatus("正在测试客户端到服务器的连接…");
-            var elapsed = await api.CheckConnectivityAsync(lifetime.Token);
-            SetStatus($"连接成功，耗时 {elapsed.TotalMilliseconds:0} 毫秒。");
+            if (loginStatus.IsDisposed) return;
+            var note = string.IsNullOrWhiteSpace(latest.Notes) ? "" : "（" + latest.Notes + "）";
+            loginStatus.Text = launcherDownload is null
+                ? $"加载器有新版本 {latest.Version}{note}，请联系管理员获取。"
+                : $"加载器有新版本 {latest.Version}{note}，点击这里下载。";
+            loginStatus.Cursor = launcherDownload is null ? Cursors.Default : Cursors.Hand;
         });
     }
 
@@ -172,13 +234,31 @@ internal sealed class LauncherForm : Form
         libraryPage.Decorations = (g, scale) =>
             g.DrawImage(GlassTheme.Logo, 32 * scale, 29 * scale, 44 * scale, 44 * scale);
         AddLabel(libraryPage, "chispa", 88, 23, 24, Color.White, true, 180);
-        AddLabel(libraryPage, "让每一次启动，都有新的闪光。", 90, 65, 9, Muted, false, 340);
-        welcome.SetBounds(650, 34, 230, 30);
+        AddLabel(libraryPage, "让每一次启动，都有新的闪光。", 90, 78, 9, Muted, false, 280);
+        var accountPanel = new GlassPanel { Name = "accountPanel", Bounds = new Rectangle(400, 18, 458, 100) };
+        libraryPage.Controls.Add(accountPanel);
+        welcome.SetBounds(16, 9, 426, 26);
         welcome.ForeColor = Muted;
         welcome.BackColor = Color.Transparent;
-        welcome.TextAlign = ContentAlignment.MiddleRight;
-        libraryPage.Controls.Add(welcome);
-        ConfigureButton(libraryPage, logout, "退出登录", 900, 30, 108, false);
+        welcome.TextAlign = ContentAlignment.MiddleLeft;
+        welcome.AutoEllipsis = true;
+        accountPanel.Controls.Add(welcome);
+        accountTime.SetBounds(16, 37, 426, 26);
+        accountTime.ForeColor = Muted;
+        accountTime.BackColor = Color.Transparent;
+        accountTime.TextAlign = ContentAlignment.TopLeft;
+        accountTime.Font = new Font("Microsoft YaHei UI", 10);
+        accountTime.AccessibleName = "账户剩余时间";
+        accountPanel.Controls.Add(accountTime);
+        accountExpiry.SetBounds(16, 65, 426, 26);
+        accountExpiry.Font = new Font("Microsoft YaHei UI", 9);
+        accountExpiry.ForeColor = Muted;
+        accountExpiry.BackColor = Color.Transparent;
+        accountExpiry.AccessibleName = "账户到期时间";
+        accountPanel.Controls.Add(accountExpiry);
+        ConfigureButton(libraryPage, logout, "退出登录", 880, 18, 128, false);
+        ConfigureButton(libraryPage, redeemCode, "兑换激活码", 880, 70, 128, false);
+        redeemCode.Click += (_, _) => ShowRedemption();
         logout.Click += async (_, _) => await RunBusy(async () =>
         {
             var message = "已退出登录。";
@@ -189,36 +269,36 @@ internal sealed class LauncherForm : Form
             }
             finally { if (!IsDisposed) ReturnToLogin(message); }
         });
-        AddLabel(libraryPage, "程序库", 32, 112, 21, Color.White, true, 230);
-        catalogCount.SetBounds(155, 124, 420, 24);
+        AddLabel(libraryPage, "程序库", 32, 130, 21, Color.White, true, 120);
+        catalogCount.SetBounds(164, 143, 420, 26);
         catalogCount.ForeColor = Muted;
         catalogCount.BackColor = Color.Transparent;
         libraryPage.Controls.Add(catalogCount);
-        ConfigureButton(libraryPage, syncCatalog, "同步程序", 880, 110, 128, false);
+        ConfigureButton(libraryPage, syncCatalog, "同步程序", 880, 130, 128, false);
         syncCatalog.Click += async (_, _) => await RunBusy(() => RefreshCatalogAsync(silent: false));
-        programCards.SetBounds(32, 174, 604, 362);
+        programCards.SetBounds(32, 190, 604, 350);
         programCards.AutoScroll = true;
         programCards.WrapContents = true;
         programCards.BackColor = Color.Transparent;
         programCards.Padding = new Padding(0);
         libraryPage.Controls.Add(programCards);
-        var detail = new GlassPanel { Bounds = new Rectangle(660, 174, 348, 362) };
+        var detail = new GlassPanel { Bounds = new Rectangle(660, 190, 348, 350) };
         libraryPage.Controls.Add(detail);
         AddLabel(detail, "准备就绪，从这里开始", 24, 21, 9, Accent, true, 296);
-        programName.SetBounds(23, 53, 300, 58);
+        programName.SetBounds(23, 50, 300, 66);
         programName.ForeColor = Color.White;
         programName.BackColor = Color.Transparent;
-        programName.Font = new Font("Microsoft YaHei UI", 19, FontStyle.Bold);
+        programName.Font = new Font("Microsoft YaHei UI", 18, FontStyle.Bold);
         programName.AutoEllipsis = true;
         detail.Controls.Add(programName);
-        version.SetBounds(25, 121, 298, 58);
+        version.SetBounds(25, 122, 298, 46);
         version.ForeColor = Muted;
         version.BackColor = Color.Transparent;
         version.Font = new Font("Microsoft YaHei UI", 9);
         detail.Controls.Add(version);
-        ConfigureButton(detail, refresh, "检查更新", 24, 188, 300, false);
-        ConfigureButton(detail, install, "下载 / 更新", 24, 241, 300, true);
-        ConfigureButton(detail, launch, "启动程序  ↗", 24, 294, 300, false);
+        ConfigureButton(detail, refresh, "检查更新", 24, 176, 300, false);
+        ConfigureButton(detail, install, "下载 / 更新", 24, 229, 300, true);
+        ConfigureButton(detail, launch, "启动程序  ↗", 24, 282, 300, false);
         refresh.Click += async (_, _) => await RunBusy(CheckVersionAsync);
         install.Click += async (_, _) => await RunBusy(async () =>
         {
@@ -252,12 +332,17 @@ internal sealed class LauncherForm : Form
     {
         if (IsDisposed || Disposing) return;
         catalogTimer.Stop();
+        sessionGeneration++;
+        accountTimer.Stop();
         api.ClearSession();
         selected = null;
         latest = null;
         LoadProgramCards([]);
         password.Clear();
         showPassword.Checked = false;
+        registrationPage.Visible = false;
+        registrationPassword.Clear();
+        registrationCode.Clear();
         libraryPage.Visible = false;
         loginPage.Visible = true;
         AcceptButton = login;
@@ -267,11 +352,13 @@ internal sealed class LauncherForm : Form
 
     private void LoadProgramCards(IReadOnlyList<ProgramInfo> programs)
     {
+        var scroll = programCards.AutoScrollPosition;
+        programCards.SuspendLayout();
         foreach (Control card in programCards.Controls.Cast<Control>().ToArray()) card.Dispose();
         programCards.Controls.Clear();
         if (programs.Count == 0)
         {
-            programCards.Controls.Add(new Label { Text = "还没有可用程序\n授权后，点击“同步程序”即可查看。", Width = 555, Height = 150,
+            programCards.Controls.Add(new GlassLabel { Text = "还没有可用程序\n授权后，点击“同步程序”即可查看。", Width = 555, Height = 150,
                 ForeColor = Muted, BackColor = Color.Transparent, Padding = new Padding(20), Font = new Font("Microsoft YaHei UI", 12) });
         }
         foreach (var program in programs)
@@ -289,14 +376,42 @@ internal sealed class LauncherForm : Form
             };
             programCards.Controls.Add(card);
         }
+        programCards.ResumeLayout();
+        programCards.AutoScrollPosition = new Point(-scroll.X, -scroll.Y);
+    }
+
+    private async Task BackgroundSyncAsync()
+    {
+        backgroundSync = true;
+        var generation = sessionGeneration;
+        try { await RefreshCatalogAsync(silent: true); }
+        catch (SessionExpiredException)
+        {
+            if (generation == sessionGeneration && libraryPage.Visible && !busy)
+                ReturnToLogin("登录已失效，请重新登录。");
+        }
+        catch (Exception ex)
+        {
+            // Preserve the current view and last server deadline; the next scheduled sync retries.
+            Debug.WriteLine("Background account sync: " + ex.GetType().Name);
+        }
+        finally { backgroundSync = false; }
     }
 
     private async Task RefreshCatalogAsync(bool silent)
     {
+        var generation = sessionGeneration;
+        var wasExpired = api.AccountExpired;
+        await api.RefreshAccountAsync(lifetime.Token);
+        if (silent && (busy || generation != sessionGeneration || !libraryPage.Visible)) return;
+        UpdateAccountTime();
         var programs = await api.GetProgramsAsync(lifetime.Token);
+        if (silent && (busy || generation != sessionGeneration || !libraryPage.Visible)) return;
         var current = programCards.Controls.OfType<ProgramTile>().Select(card => card.Program).ToArray();
         if (current.SequenceEqual(programs))
         {
+            if (wasExpired && !api.AccountExpired && selected is not null) await CheckVersionAsync(silent);
+            UpdateControls();
             if (!silent) SetStatus("程序列表已同步，暂无变化。");
             return;
         }
@@ -306,23 +421,32 @@ internal sealed class LauncherForm : Form
         selected = programs.FirstOrDefault(p => p.Id == previousId) ?? programs.FirstOrDefault();
         latest = null;
         MarkSelection();
-        if (selected is not null) await CheckVersionAsync();
-        SetStatus($"程序列表已同步，当前有 {programs.Count} 个选项。");
+        if (selected is not null) await CheckVersionAsync(silent);
+        if (!silent) SetStatus($"程序列表已同步，当前有 {programs.Count} 个选项。");
     }
 
     private void MarkSelection()
     {
         foreach (var card in programCards.Controls.OfType<ProgramTile>())
         {
-            card.IsSelected = card.Program.Id == selected?.Id;
-            card.Invalidate();
+            var isSelected = card.Program.Id == selected?.Id;
+            if (card.IsSelected != isSelected) { card.IsSelected = isSelected; card.Invalidate(); }
         }
         UpdateControls();
     }
 
-    private async Task CheckVersionAsync()
+    private Task CheckVersionAsync() => CheckVersionAsync(false);
+
+    private async Task CheckVersionAsync(bool silent)
     {
         if (selected is null) return;
+        if (api.AccountExpired)
+        {
+            latest = null;
+            SetStatus("账户授权已到期，可登录查看账户；续期后点击“同步程序”即可继续使用。");
+            UpdateControls();
+            return;
+        }
         if (selected.HasRelease == false)
         {
             latest = null;
@@ -330,9 +454,13 @@ internal sealed class LauncherForm : Form
             UpdateControls();
             return;
         }
-        SetStatus($"正在查询 {selected.Name} 的版本…");
-        latest = await api.GetLatestAsync(selected.Id, lifetime.Token);
-        SetStatus(installer.InstalledVersion(selected) == latest.Version
+        var program = selected;
+        var generation = sessionGeneration;
+        if (!silent) SetStatus($"正在查询 {program.Name} 的版本…");
+        var release = await api.GetLatestAsync(program.Id, lifetime.Token);
+        if (generation != sessionGeneration || selected?.Id != program.Id || (silent && busy)) return;
+        latest = release;
+        if (!silent) SetStatus(installer.InstalledVersion(selected) == latest.Version
             ? $"{selected.Name} 已是最新版本。"
             : $"{selected.Name} {latest.Version} 可下载。");
         UpdateControls();
@@ -344,8 +472,19 @@ internal sealed class LauncherForm : Form
         busy = true;
         UpdateControls();
         try { await operation(); }
-        catch (SessionExpiredException) { ReturnToLogin("登录已失效，请重新登录。"); }
-        catch (HttpRequestException) { SetStatus("无法连接服务器，请检查服务端是否启动，并使用“测试连接”诊断。"); }
+        catch (SessionExpiredException)
+        {
+            // Subscription expiry still permits account inspection; a revoked login does not.
+            try
+            {
+                await api.RefreshAccountAsync(lifetime.Token);
+                UpdateAccountTime();
+                if (api.AccountExpired) SetStatus("账户授权已到期，续期后点击“同步程序”即可继续使用。");
+                else ReturnToLogin("登录已失效，请重新登录。");
+            }
+            catch { ReturnToLogin("登录已失效，请重新登录。"); }
+        }
+        catch (HttpRequestException) { SetStatus("无法连接服务器，请检查网络或稍后重试。"); }
         catch (TaskCanceledException) { SetStatus("连接超时，请检查网络或稍后重试。"); }
         catch (Exception ex) { SetStatus(ex.Message); }
         finally { busy = false; if (!IsDisposed) UpdateControls(); }
@@ -355,6 +494,7 @@ internal sealed class LauncherForm : Form
     {
         if (IsDisposed || Disposing) return;
         if (libraryPage.Visible) libraryStatus.Text = message;
+        else if (registrationPage.Visible) registrationStatus.Text = message;
         else loginStatus.Text = message;
     }
 
@@ -369,20 +509,43 @@ internal sealed class LauncherForm : Form
         showPassword.Enabled = !busy;
         login.Text = busy && loginPage.Visible ? "正在连接…" : "进入程序库   →";
         login.Enabled = !busy;
-        testConnection.Enabled = !busy;
+        registerAccount.Enabled = !busy;
+        redeemCode.Enabled = !busy;
+        submitRegistration.Enabled = !busy;
+        registrationBack.Enabled = !busy;
+        registrationEmail.Enabled = !busy;
+        registrationPassword.Enabled = !busy && !redeeming;
+        registrationCode.Enabled = !busy;
         syncCatalog.Enabled = !busy;
         username.Enabled = !busy;
         password.Enabled = !busy;
         remember.Enabled = !busy;
         programCards.Enabled = !busy;
-        refresh.Enabled = !busy && selected?.HasRelease != false && selected is not null;
-        install.Enabled = !busy && selected?.HasRelease != false && selected is not null && latest is not null;
+        refresh.Enabled = !busy && !api.AccountExpired && selected?.HasRelease != false && selected is not null;
+        install.Enabled = !busy && !api.AccountExpired && selected?.HasRelease != false && selected is not null && latest is not null;
         install.Text = installed is not null && installed == latest?.Version ? "重新安装 / 修复" : "下载 / 更新";
         ((GlassButton)install).Primary = installed is null || installed != latest?.Version;
         ((GlassButton)launch).Primary = installed is not null;
-        install.Invalidate();
-        launch.Invalidate();
-        launch.Enabled = !busy && selected?.HasRelease != false && selected is not null && installed is not null;
+        launch.Enabled = !busy && !api.AccountExpired && selected?.HasRelease != false && selected is not null && installed is not null;
+    }
+
+    private void UpdateAccountTime()
+    {
+        if (api.Account is not { } account) { accountTime.Text = accountExpiry.Text = ""; return; }
+        welcome.Text = "欢迎，" + account.Username;
+        if (account.AccountExpiresAt is not { } expiry)
+        {
+            accountTime.Text = "剩余时间：永久";
+            accountExpiry.Text = "到期时间：永久有效";
+            accountTime.ForeColor = Muted;
+            return;
+        }
+        var remaining = expiry - api.ServerNow;
+        var countdown = remaining <= TimeSpan.Zero ? "已到期"
+            : $"{(long)remaining.TotalDays} 天 {remaining.Hours:00}:{remaining.Minutes:00}:{remaining.Seconds:00}";
+        accountTime.Text = $"剩余时间：{countdown}";
+        accountExpiry.Text = $"到期时间：{expiry.ToLocalTime():yyyy-MM-dd HH:mm:ss}（本地时间）";
+        accountTime.ForeColor = remaining <= TimeSpan.Zero ? Color.Salmon : Muted;
     }
 
     private static void PaintLoginArt(Graphics g, float scale)
@@ -411,12 +574,12 @@ internal sealed class LauncherForm : Form
         Color color, bool bold, int width)
     {
         var font = new Font("Microsoft YaHei UI", fontSize, bold ? FontStyle.Bold : FontStyle.Regular);
-        var measured = TextRenderer.MeasureText(text, font, new Size(width, int.MaxValue),
-            TextFormatFlags.WordBreak | TextFormatFlags.NoPadding);
-        parent.Controls.Add(new Label
+        var measured = GlassLabel.Measure(text, font, width);
+        parent.Controls.Add(new GlassLabel
         {
             Text = text, Left = x, Top = y, Width = width,
-            Height = Math.Max(measured.Height, font.Height),
+            // Leave room for GDI line-height rounding at fractional monitor scales.
+            Height = measured.Height + 4,
             ForeColor = color, BackColor = Color.Transparent, Font = font
         });
     }
@@ -424,10 +587,19 @@ internal sealed class LauncherForm : Form
     private static void ConfigureText(Control parent, TextBox box, int x, int y, int width)
     {
         var shell = new GlassField { Bounds = new Rectangle(x, y, width, 46) };
-        box.SetBounds(14, 11, width - 28, 26);
         box.BackColor = GlassTheme.Field;
         box.ForeColor = Color.White;
         box.BorderStyle = BorderStyle.None;
+        // A single-line native edit chooses its height from the font. Center that actual
+        // height after layout/DPI changes instead of freezing a 26-pixel text rectangle.
+        box.AutoSize = true;
+        shell.Layout += (_, _) =>
+        {
+            var inset = (int)Math.Round(14 * shell.DeviceDpi / 96f);
+            var height = box.PreferredHeight;
+            box.SetBounds(inset, Math.Max(0, (shell.ClientSize.Height - height) / 2),
+                Math.Max(1, shell.ClientSize.Width - 2 * inset), height);
+        };
         box.Enter += (_, _) => shell.Highlighted = true;
         box.Leave += (_, _) => shell.Highlighted = false;
         shell.Controls.Add(box);
@@ -450,30 +622,29 @@ internal sealed class LauncherForm : Form
         parent.Controls.Add(button);
     }
 
-    private void ConfigureWindowChrome(GlassCanvas page)
+    private void ConfigureWindowChrome()
     {
-        page.MouseDown += (_, e) =>
+        var titleBar = new GlassLayer { Name = "windowTitleBar", Dock = DockStyle.Top, Height = 36,
+            Padding = new Padding(18, 4, 18, 0), BackColor = Background };
+        windowSurface.Controls.Add(titleBar);
+        titleBar.MouseDown += (_, e) =>
         {
-            if (e.Button != MouseButtons.Left || e.Y >= 30 * DeviceDpi / 96) return;
+            if (e.Button != MouseButtons.Left) return;
             ReleaseCapture();
             SendMessage(Handle, 0xA1, (IntPtr)2, IntPtr.Zero); // WM_NCLBUTTONDOWN / HTCAPTION
         };
         var minimize = new ChromeButton(close: false)
         {
-            Bounds = new Rectangle(952, 4, 40, 27),
-            Anchor = AnchorStyles.Top | AnchorStyles.Right
+            Name = "windowMinimize", AccessibleName = "最小化", Dock = DockStyle.Right, Width = 44
         };
         minimize.Click += (_, _) => WindowState = FormWindowState.Minimized;
-        page.Controls.Add(minimize);
+        titleBar.Controls.Add(minimize);
         var close = new ChromeButton(close: true)
         {
-            Bounds = new Rectangle(995, 4, 40, 27),
-            Anchor = AnchorStyles.Top | AnchorStyles.Right
+            Name = "windowClose", AccessibleName = "关闭", Dock = DockStyle.Right, Width = 44
         };
         close.Click += (_, _) => Close();
-        page.Controls.Add(close);
-        minimize.BringToFront();
-        close.BringToFront();
+        titleBar.Controls.Add(close);
     }
 
     [DllImport("user32.dll")]
@@ -495,6 +666,12 @@ internal sealed class LauncherForm : Form
         if (IsHandleCreated) RoundWindowCorners();
     }
 
+    protected override void OnDpiChanged(DpiChangedEventArgs e)
+    {
+        base.OnDpiChanged(e);
+        if (IsHandleCreated) RoundWindowCorners();
+    }
+
     private void RoundWindowCorners()
     {
         if (Width <= 0 || Height <= 0) return;
@@ -512,6 +689,8 @@ internal sealed class LauncherForm : Form
         lifetime.Dispose();
         catalogTimer.Stop();
         catalogTimer.Dispose();
+        accountTimer.Stop();
+        accountTimer.Dispose();
         Icon?.Dispose();
         api.Dispose();
         base.OnFormClosed(e);

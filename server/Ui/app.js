@@ -1,5 +1,5 @@
-(() => {
-  const views = {overview:['服务器概览','掌握运行状态，让每一次分发都有条不紊。'],accounts:['账号管理','管理账号期限与程序权限。'],programs:['程序管理','整理程序、图标与 Beta 选项。'],release:['版本发布','将新的版本，交付给已授权用户。'],connectivity:['连接诊断','检查客户端与服务器之间的连接。']};
+﻿(() => {
+  const views = {overview:['服务器概览','掌握运行状态，让每一次分发都有条不紊。'],accounts:['账号管理','管理账号期限与程序权限。'],activation:['激活码管理','生成、查看和作废注册及续费激活码。'],programs:['程序管理','整理程序、图标与 Beta 选项。'],release:['版本发布','将新的版本，交付给已授权用户。'],connectivity:['连接诊断','检查客户端与服务器之间的连接。']};
   const sections = [...document.querySelectorAll('[data-view]')];
   function selectView() {
     let saved; try { saved = sessionStorage.getItem('chispa-view'); } catch {}
@@ -34,7 +34,22 @@
     sync();
   }
   for (const form of document.querySelectorAll('form')) {
-    form.addEventListener('submit',event => {
+    form.addEventListener('submit',async event => {
+      if(form.dataset.download){
+        event.preventDefault();
+        const button=event.submitter, status=form.querySelector('[data-download-status]');
+        if(button.disabled)return;
+        button.disabled=true;status.textContent='正在生成…';
+        try{
+          const response=await fetch(form.action,{method:'POST',body:new FormData(form),credentials:'same-origin'});
+          if(!response.ok){let error;try{error=(await response.json()).error;}catch{}throw new Error(error||'生成失败，请检查登录状态。');}
+          const url=URL.createObjectURL(await response.blob()),link=document.createElement('a');
+          link.href=url;link.download='chispa-activation-'+Date.now()+'.csv';link.click();setTimeout(()=>URL.revokeObjectURL(url),60000);
+          status.textContent='已生成并下载。完整激活码只提供这一次，请保存 CSV。刷新页面可查看记录。';
+        }catch(error){status.textContent=error.message+' 如果连接中断，请先刷新记录，确认是否已经生成。';}
+        finally{button.disabled=false;}
+        return;
+      }
       if(form.dataset.confirm && !confirm(form.dataset.confirm)){event.preventDefault();return;}
       const button=event.submitter;
       if(button){button.dataset.idleText=button.textContent;button.disabled=true;button.textContent=form.action.endsWith('/releases')?'正在上传并发布…':'正在处理…';}
@@ -50,6 +65,8 @@
     const button=event.submitter||releaseForm.querySelector('button');
     const label=document.getElementById('uploadSummary');
     const file=releaseForm.querySelector('[name=package]').files[0];
+    const signatureInput=releaseForm.querySelector('[name=signature]');
+    const signatureFile=signatureInput?.files[0];
     const token=releaseForm.querySelector('[name=__RequestVerificationToken]').value;
     const headers={'X-CSRF-TOKEN':token};
     const request=async(url,options={})=>{
@@ -68,9 +85,12 @@
     button.disabled=true;
     try{
       if(!file||file.size>1073741824)throw new Error('请选择不超过 1 GB 的 ZIP 文件。');
+      if(!signatureFile)throw new Error('请同时选择该版本的 signature.json（由 chispa-sign 生成）。');
+      if(signatureFile.size>65536)throw new Error('签名文件过大，不是 chispa-sign 生成的 signature.json。');
+      const signature=await signatureFile.text();
       label.textContent='准备上传 '+file.name+'…';
       const started=await request('/admin/uploads',{method:'POST',headers:{...headers,'Content-Type':'application/json'},
-        body:JSON.stringify({programId:releaseForm.elements.programId.value,version:releaseForm.elements.version.value,size:file.size})});
+        body:JSON.stringify({programId:releaseForm.elements.programId.value,version:releaseForm.elements.version.value,size:file.size,signature})});
       let offset=0;
       while(offset<file.size){
         const end=Math.min(offset+started.chunkSize,file.size);
@@ -94,7 +114,7 @@
   });
   addEventListener('pageshow',()=>document.querySelectorAll('button[data-idle-text]').forEach(button=>{button.disabled=false;button.textContent=button.dataset.idleText;}));
   const upload=document.querySelector('[name=package]');
-  upload?.addEventListener('change',()=>{const file=upload.files[0],label=document.getElementById('uploadSummary');upload.setCustomValidity(file&&file.size>1073741824?'ZIP 文件不能超过 1 GB。':'');if(label)label.textContent=file?file.name+' · '+(file.size/1048576).toFixed(1)+' MB':'选择包含入口 EXE 和运行依赖的 ZIP 文件。';});
+  upload?.addEventListener('change',()=>{const file=upload.files[0],label=document.getElementById('uploadSummary');upload.setCustomValidity(file&&file.size>1073741824?'ZIP 文件不能超过 1 GB。':'');if(label)label.textContent=file?file.name+' · '+(file.size/1048576).toFixed(1)+' MB · 请同时选择 signature.json':'选择已签名的 ZIP 与其 signature.json。';});
   const cropDialog=document.getElementById('iconCropDialog');
   if(cropDialog){
     const cropCanvas=document.getElementById('iconCropCanvas'),previewCanvas=document.getElementById('iconCropPreview');
@@ -227,5 +247,20 @@
       catch{label.textContent='连接失败或超时，请检查网络。';}
       finally{button.disabled=false;}
     });
+  }
+  // 查看用户密码的页面：只在屏幕上停留有限时间。清除的是输入框里的值；再次显示仍要通过服务器端
+  // 的短时授权，刷新或关闭页面后服务器不会把密码回填进来。
+  const secret = document.getElementById('secretValue');
+  if (secret) {
+    let left = 30;
+    const countdown = document.getElementById('secretCountdown');
+    const wipe = () => { secret.value = ''; secret.defaultValue = ''; secret.removeAttribute('value'); };
+    const timer = setInterval(() => {
+      left -= 1;
+      if (countdown) countdown.textContent = left > 0 ? left + ' 秒后自动清除' : '已清除，如需再次查看请重新验证身份';
+      if (left <= 0) { clearInterval(timer); wipe(); secret.placeholder = '已清除'; }
+    }, 1000);
+    addEventListener('pagehide', wipe);
+    addEventListener('beforeunload', wipe);
   }
 })();

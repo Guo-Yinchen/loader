@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Buffers.Binary;
 using System.Globalization;
 using System.Net;
@@ -7,9 +7,10 @@ using System.Text;
 using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
+using Chispa.AdminSecurity;
 using Microsoft.AspNetCore.Http.Features;
 
-static class AdminPages
+static partial class AdminPages
 {
     private static readonly ConcurrentDictionary<string, LoginFailures> FailedLogins = new();
     private static readonly ConcurrentDictionary<string, UploadSession> Uploads = new();
@@ -17,13 +18,17 @@ static class AdminPages
     private const long MaxPackageBytes = 1024L * 1024 * 1024;
     private const int UploadChunkBytes = 4 * 1024 * 1024;
 
-    private sealed class UploadSession(string owner, string programId, string version, long size, string path)
+    private sealed class UploadSession(string owner, string programId, string version, long size, string path,
+        string signature)
     {
         public string Owner { get; } = owner;
         public string ProgramId { get; } = programId;
         public string Version { get; } = version;
         public long Size { get; } = size;
         public string Path { get; } = path;
+        // Carried from the start request and applied at publish time: the signature belongs to the
+        // bytes, so it has to arrive with them, not after them.
+        public string Signature { get; } = signature;
         public long Received { get; set; }
         public string State { get; set; } = "uploading";
         public string? Error { get; set; }
@@ -31,9 +36,10 @@ static class AdminPages
         public SemaphoreSlim Gate { get; } = new(1, 1);
     }
 
-    private sealed record UploadStart(string ProgramId, string Version, long Size);
+    private sealed record UploadStart(string ProgramId, string Version, long Size, string? Signature);
 
-    public static void MapAdminPages(this WebApplication app, Store store, ServerMetrics metrics, Func<int> activeSessions)
+    public static void MapAdminPages(this WebApplication app, Store store, ServerMetrics metrics,
+        Func<int> activeSessions, AdminGuard guard)
     {
         app.MapAdminAssets();
         app.MapGet("/admin/login", (HttpContext context, IAntiforgery antiforgery) =>
@@ -70,9 +76,11 @@ static class AdminPages
             {
                 FailedLogins.AddOrUpdate(key, _ => new LoginFailures(1, now.AddMinutes(15)),
                     (_, old) => old.Until <= now ? new LoginFailures(1, now.AddMinutes(15)) : old with { Count = old.Count + 1 });
+                guard.Audit("admin-login", username, null, "denied-password", context);
                 return Html(Page("登录失败", "<h1>登录失败</h1><p>账号或密码错误。</p><a href='/admin/login'>返回登录</a>"), 401);
             }
             FailedLogins.TryRemove(key, out _);
+            guard.Audit("admin-login", username, null, "ok", context);
             var claims = new[] { new Claim(ClaimTypes.Name, username), new Claim("admin-hash", store.AdminHash(username)!) };
             var principal = new ClaimsPrincipal(new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme));
             await context.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, principal);
@@ -94,6 +102,7 @@ static class AdminPages
                   <nav aria-label='管理导航'>
                     <a href='#overview'><span class='nav-icon' aria-hidden='true'>▦</span>服务器概览</a>
                     <a href='#accounts'><span class='nav-icon' aria-hidden='true'>◎</span>账号管理</a>
+                    <a href='#activation'><span class='nav-icon' aria-hidden='true'>⌘</span>激活码管理</a>
                     <a href='#programs'><span class='nav-icon' aria-hidden='true'>◇</span>程序管理</a>
                     <a href='#release'><span class='nav-icon' aria-hidden='true'>↑</span>版本发布</a>
                     <a href='#connectivity'><span class='nav-icon' aria-hidden='true'>⌁</span>连接诊断</a>
@@ -115,6 +124,8 @@ static class AdminPages
                 "program" => "程序信息已保存。",
                 "removed" => "程序及其发布包已删除，相关账号的授权已同步清理。",
                 "published" => "版本已发布。",
+            "recommend" => "推荐版本已更新。",
+            "status" => "版本状态已更新。",
                 _ => null
             };
             if (noticeText is not null) body.Append("<p class='notice'>").Append(Encode(noticeText)).Append("</p>");
@@ -199,14 +210,14 @@ static class AdminPages
                         .Append(user.BetaAccess ? " checked" : "")
                         .Append(">允许 Beta</label><button class='secondary'>保存权限</button></form>")
                         .Append("<form class='passwordview' method='post' action='/admin/users/").Append(path)
-                        .Append("/password/view'>").Append(Csrf(token))
+                        .Append("/password/stepup'>").Append(Csrf(token))
                         .Append("<p class='formhead'>查看密码</p><p class='hint'>")
                         .Append(user.PasswordAvailable
-                            ? "仅管理员点击后显示；服务器加密保存此密码，请妥善保管后台登录权限与密钥。"
-                            : "此账号在启用密码保存前创建，旧密码只有哈希，无法还原；重置后可查看新密码。")
-                        .Append("</p><button class='secondary'")
+                            ? "每次查看都要重新输入你的管理员密码；验证通过后两分钟内有效，最多查看 3 次。服务器加密保存此密码，请妥善保管后台登录权限与密钥。"
+                            : "此账号的密码只有哈希，无法还原；如需修改，请使用重置密码功能。")
+                        .Append("</p><label>管理员密码（确认身份）<input name='adminPassword' type='password' autocomplete='current-password' maxlength='200' required></label><button class='secondary'")
                         .Append(user.PasswordAvailable ? "" : " disabled")
-                        .Append(">显示用户密码</button></form>")
+                        .Append(">验证并查看</button></form>")
                         .Append("<form class='passwordform' method='post' action='/admin/users/").Append(path)
                         .Append("/password' data-confirm='确认修改账号 “").Append(Encode(user.Username))
                         .Append("” 的密码？保存后该账号当前的登录会话会立即失效，需要用新密码重新登录。'>")
@@ -268,11 +279,13 @@ static class AdminPages
                     .Append("<form class='deleteform' method='post' action='/admin/programs/").Append(Uri.EscapeDataString(program.Id))
                     .Append("/delete' data-confirm='确定删除程序 “").Append(Encode(program.Name)).Append("”（").Append(Encode(program.Id))
                     .Append("）？已发布的全部版本会一并删除，引用它的账号授权会被移除，此操作不可撤销。'>")
-                    .Append(Csrf(token)).Append("<button class='danger'>删除程序</button></form></details>");
+                    .Append(Csrf(token)).Append("<button class='danger'>删除程序</button></form>")
+                    .Append(VersionPanel(program, store.Releases(program.Id), token))
+                    .Append("</details>");
             }
             body.Append("""
                 </section><section id='release' data-view='release' class='card'><h2>发布版本</h2>
-                <p class='hint'>选择程序、填写新版本号，并上传包含入口 EXE 和全部运行依赖的 ZIP。入口 EXE 放在 ZIP 顶层；如果整个包只套了一个外层文件夹（例如直接压缩了一个程序文件夹），服务器会自动去掉这一层；__MACOSX、Thumbs.db、desktop.ini 这类系统文件会被忽略。最大 1 GB。</p>
+                <p class='hint'>发布包必须由发布环境签名：在打包机上运行 <code>chispa-sign pack</code> 打包、<code>chispa-sign sign</code> 签名，然后把 ZIP 和 signature.json 一起上传。签名覆盖程序 ID、版本、入口 EXE、包大小、包 SHA-256 和文件清单，服务器只校验和保存，不会改写 ZIP，也不能代替打包机签名。入口 EXE 放在 ZIP 顶层，最大 1 GB。</p>
                 <form id='releaseUpload' method='post' action='/admin/releases' enctype='multipart/form-data'>
                 """).Append(Csrf(token)).Append("<div class='fields'><label>程序<select name='programId' required>");
             foreach (var program in programs)
@@ -280,8 +293,9 @@ static class AdminPages
                     .Append(Encode(program.Name)).Append(" (").Append(Encode(program.Id)).Append(")</option>");
             body.Append("""
                 </select></label><label>版本号<input name='version' required pattern='[0-9]+\.[0-9]+\.[0-9]+' placeholder='1.0.0'></label>
-                <label>运行包 ZIP<input name='package' type='file' accept='.zip,application/zip' required></label></div>
-                <p class='upload-summary' id='uploadSummary' aria-live='polite'>选择包含入口 EXE 和运行依赖的 ZIP 文件。</p><button>上传并发布</button></form></section></main>
+                <label>运行包 ZIP<input name='package' type='file' accept='.zip,application/zip' required></label>
+                <label>发布签名 signature.json<input name='signature' type='file' accept='.json,application/json' required></label></div>
+                <p class='upload-summary' id='uploadSummary' aria-live='polite'>选择已签名的 ZIP 与其 signature.json。</p><button>上传并发布</button></form></section></main>
                 <dialog id='iconCropDialog' class='icon-crop-dialog' aria-labelledby='iconCropTitle'>
                   <div class='icon-crop-head'><div><p class='eyebrow'>ICON EDITOR</p><h2 id='iconCropTitle'>裁剪图标</h2></div><button type='button' class='secondary' id='iconCropCancel' aria-label='取消裁剪'>取消</button></div>
                   <p class='hint'>拖动图片调整位置，滑动下方控件缩放。右侧是加载器中的圆角预览。</p>
@@ -291,6 +305,7 @@ static class AdminPages
                   <button type='button' id='iconCropConfirm'>使用这个裁剪</button>
                 </dialog>
                 """);
+            body.Replace("</main>", ActivationSection(store, programs, token) + "</main>");
             return Html(Page("概览", body.ToString()));
         }).RequireAuthorization();
 
@@ -362,21 +377,107 @@ static class AdminPages
 
         // Second step of the reset flow: the checkbox must be ticked before the server
         // touches the hash, so a mis-click cannot lock a user out of their account.
+        // Re-authentication before a secret is shown. The admin types their own password here; the
+        // server decides, and on success hands out a short-lived grant for the view endpoint below.
+        // A browser dialog or a checkbox would prove nothing, which is why neither is used.
+        app.MapPost("/admin/users/{username}/password/stepup", async (string username, HttpContext context, IAntiforgery antiforgery) =>
+        {
+            var admin = context.User.Identity?.Name ?? "unknown";
+            if (!await ValidCsrf(context, antiforgery))
+            {
+                guard.Audit("step-up", admin, username, "denied-csrf", context);
+                return Results.BadRequest("Invalid form token.");
+            }
+            var ip = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+            if (guard.StepUpBlocked(admin, ip))
+            {
+                guard.Audit("step-up", admin, username, "denied-rate", context);
+                return Html(Page("请稍后重试",
+                    "<h1>验证暂时受限</h1><p>失败次数过多，请 15 分钟后再试，或在本机终端检查管理员账号。</p><a href='/admin#accounts'>返回账号管理</a>"), 429);
+            }
+            var form = await context.Request.ReadFormAsync();
+            if (!store.VerifyAdmin(admin, form["adminPassword"].ToString()))
+            {
+                guard.RecordStepUpFailure(admin, ip);
+                guard.Audit("step-up", admin, username, "denied-password", context);
+                return Html(Page("验证失败",
+                    "<h1>身份验证失败</h1><p>管理员密码不正确。</p><a href='/admin#accounts'>返回账号管理</a>"), 401);
+            }
+            guard.ClearStepUpFailures(admin, ip);
+            var grant = guard.IssueGrant(admin, AdminGuard.SessionBinding(context), username);
+            guard.Audit("step-up", admin, username, "ok", context);
+            var token = antiforgery.GetAndStoreTokens(context).RequestToken!;
+            var body = new StringBuilder()
+                .Append("<h2>身份已验证</h2><p class='hint'>授权在 ")
+                .Append(guard.StepUpSeconds).Append(" 秒内有效，最多可查看 ").Append(guard.StepUpUses)
+                .Append(" 次。仅显示这一次，关闭或刷新页面后不会保留。</p>")
+                .Append("<form method='post' action='/admin/users/").Append(Uri.EscapeDataString(username))
+                .Append("/password/view'>").Append(Csrf(token))
+                .Append("<input type='hidden' name='grant' value='").Append(Encode(grant)).Append("'>")
+                .Append("<button class='secondary'>显示 ").Append(Encode(username)).Append(" 的密码</button></form>")
+                .Append("<p class='hint'>已知限制：密码一旦显示在屏幕上，浏览器截图、录屏或旁人看到的内容无法通过技术手段收回。</p>")
+                .Append("<a class='button' href='/admin#accounts'>返回账号管理</a>");
+            return NoStore(context, Html(Page("验证管理员身份", body.ToString())));
+        }).RequireAuthorization();
+
         app.MapPost("/admin/users/{username}/password/view", async (string username, HttpContext context, IAntiforgery antiforgery) =>
         {
-            if (!await ValidCsrf(context, antiforgery)) return Results.BadRequest("Invalid form token.");
+            var admin = context.User.Identity?.Name ?? "unknown";
+            if (!await ValidCsrf(context, antiforgery))
+            {
+                guard.Audit("password-view", admin, username, "denied-csrf", context);
+                return Results.BadRequest("Invalid form token.");
+            }
+            if (guard.ViewBlocked(admin))
+            {
+                guard.Audit("password-view", admin, username, "denied-rate", context);
+                return Html(Page("请稍后重试",
+                    "<h1>查看次数过多</h1><p>请 10 分钟后再试。</p><a href='/admin#accounts'>返回账号管理</a>"), 429);
+            }
+            var form = await context.Request.ReadFormAsync();
+            var check = guard.TryConsumeGrant(admin, AdminGuard.SessionBinding(context), username, form["grant"].ToString());
+            if (check != AdminGuard.GrantCheck.Valid)
+            {
+                // Missing / expired / foreign grant all mean "prove yourself again". The reason is
+                // audited; the page does not say which one, so the grant space cannot be probed.
+                guard.Audit("password-view", admin, username,
+                    check switch
+                    {
+                        AdminGuard.GrantCheck.Expired => "denied-expired",
+                        AdminGuard.GrantCheck.Foreign => "denied-foreign",
+                        _ => "denied-missing-grant",
+                    }, context);
+                return Html(Page("需要重新验证",
+                    "<h1>需要重新验证身份</h1><p>查看密码前必须在两分钟内重新输入管理员密码。</p><a href='/admin#accounts'>返回账号管理</a>"), 403);
+            }
+            guard.RecordView(admin);
             try
             {
                 var password = store.ViewUserPassword(username);
-                var content = password is null
-                    ? "<p class='hint'>旧密码无法还原。请返回账号管理并重置密码。</p>"
-                    : "<label>" + Encode(username) + " 的当前密码<input type='text' readonly autocomplete='off' value='" + Encode(password) + "'></label>";
-                return Html(Page("查看用户密码", "<h2>查看用户密码</h2>" + content +
-                    "<p class='hint'>关闭此页面后，密码不会留在账号列表中。</p><a class='button' href='/admin#accounts'>返回账号管理</a>"));
+                if (password is null)
+                {
+                    guard.Audit("password-view", admin, username, "no-ciphertext", context);
+                    return NoStore(context, Html(Page("查看用户密码",
+                        "<h2>查看用户密码</h2><p class='hint'>旧密码无法还原。请返回账号管理并重置密码。</p>" +
+                        "<a class='button' href='/admin#accounts'>返回账号管理</a>")));
+                }
+                guard.Audit("password-view", admin, username, "ok", context);
+                var content = "<h2>查看用户密码</h2><p class='hint'>此内容只显示这一次，30 秒后自动清除；刷新、关闭或退出登录后不会保留。</p>" +
+                    "<label>" + Encode(username) + " 的当前密码<input id='secretValue' type='text' readonly " +
+                    "autocomplete='off' spellcheck='false' value='" + Encode(password) + "'></label>" +
+                    "<p class='hint' id='secretCountdown' aria-live='polite'>30 秒后自动清除</p>" +
+                    "<p class='hint'>已知限制：密码显示期间，浏览器截图、录屏或旁人看到的内容无法技术性收回；" +
+                    "请确认屏幕只有你可见。</p><a class='button' href='/admin#accounts'>返回账号管理</a>";
+                return NoStore(context, Html(Page("查看用户密码", content)));
             }
-            catch (ArgumentException ex) { return Error(ex.Message); }
+            catch (ArgumentException ex)
+            {
+                guard.Audit("password-view", admin, username, "error", context);
+                return Error(ex.Message);
+            }
             catch (System.Security.Cryptography.CryptographicException)
             {
+                guard.Audit("password-view", admin, username, "error-undecryptable", context);
                 return Error("无法解密密码，请检查服务器密钥目录是否完整。");
             }
         }).RequireAuthorization();
@@ -450,12 +551,19 @@ static class AdminPages
                 !System.Text.RegularExpressions.Regex.IsMatch(input.Version ?? "", "^[0-9]+\\.[0-9]+\\.[0-9]+$") ||
                 store.FindProgram(input.ProgramId ?? "") is null)
                 return Results.BadRequest(new { error = "请选择已登记的程序、有效版本号和不超过 1 GB 的 ZIP。" });
+            // The signature is small (a JSON envelope), so an inline field is enough and keeps the
+            // chunked ZIP path unchanged. It is required: an unsigned upload can no longer publish.
+            var signature = input.Signature ?? "";
+            if (signature.Length is < 64 or > 64 * 1024 ||
+                !signature.Contains("chispa-release-signature-v1", StringComparison.Ordinal))
+                return Results.BadRequest(new { error = "缺少发布签名文件，或签名文件不是 chispa-sign 生成的格式。请上传 package.zip 与 signature.json。" });
             Directory.CreateDirectory(store.UploadDirectory);
             PruneUploads(store.UploadDirectory);
             var id = Guid.NewGuid().ToString("N");
             var path = Path.Combine(store.UploadDirectory, id + ".zip");
             await using (File.Create(path)) { }
-            var session = new UploadSession(context.User.Identity!.Name!, input.ProgramId!, input.Version!, input.Size, path);
+            var session = new UploadSession(context.User.Identity!.Name!, input.ProgramId!, input.Version!,
+                input.Size, path, signature);
             Uploads[id] = session;
             return Results.Ok(new { id, chunkSize = UploadChunkBytes });
         }).RequireAuthorization();
@@ -519,7 +627,7 @@ static class AdminPages
                 try
                 {
                     await store.PublishArchiveFileAsync(session.ProgramId, session.Version, session.Path,
-                        CancellationToken.None);
+                        session.Signature, CancellationToken.None);
                 }
                 catch (Exception ex)
                 {
@@ -565,15 +673,57 @@ static class AdminPages
                 var package = form.Files.GetFile("package");
                 if (package is null || package.Length == 0 || package.Length > 1024L * 1024 * 1024)
                     throw new ArgumentException("请选择不超过 1 GB 的 ZIP 文件。");
+                var signatureFile = form.Files.GetFile("signature");
+                if (signatureFile is null || signatureFile.Length is < 64 or > 64 * 1024)
+                    throw new ArgumentException("请同时上传签名文件（signature.json）。");
+                string signature;
+                using (var reader = new StreamReader(signatureFile.OpenReadStream()))
+                    signature = await reader.ReadToEndAsync();
                 await using var stream = package.OpenReadStream();
-                await store.PublishArchiveAsync(form["programId"].ToString(), form["version"].ToString(), stream, context.RequestAborted);
+                await store.PublishArchiveAsync(form["programId"].ToString(), form["version"].ToString(),
+                    stream, signature, context.RequestAborted);
                 return Results.Redirect("/admin?notice=published");
             }
             catch (ArgumentException ex) { return Error(ex.Message); }
             catch (InvalidOperationException ex) { return Error(ex.Message); }
-            catch (InvalidDataException) { return Error("ZIP 文件无法读取或格式无效。"); }
+            // Since publishing is signed, an InvalidDataException carries the operator's answer
+            // ("the signature does not match", "the package still has junk in it"), not a raw ZIP
+            // diagnostic - so it is shown instead of the generic "invalid ZIP" text.
+            catch (InvalidDataException ex) { return Error(ex.Message); }
         }).RequireAuthorization();
 
+        // Which version the loader offers, and whether a published version may still be handed out
+        // / started. Both actions are audited: "who made 1.2.3 unavailable" is a question that gets
+        // asked after an incident.
+        app.MapPost("/admin/programs/{id}/recommend", async (string id, HttpContext context, IAntiforgery antiforgery) =>
+        {
+            if (!await ValidCsrf(context, antiforgery)) return Results.BadRequest("Invalid form token.");
+            var form = await context.Request.ReadFormAsync();
+            try
+            {
+                var version = EmptyToNull(form["version"].ToString());
+                store.SetRecommendedVersion(id, version);
+                guard.Audit("release-recommend", context.User.Identity?.Name ?? "unknown",
+                    id + "=" + (version ?? "auto"), "ok", context);
+                return Results.Redirect("/admin?notice=recommend#programs");
+            }
+            catch (ArgumentException ex) { return Error(ex.Message); }
+        }).RequireAuthorization();
+
+        app.MapPost("/admin/programs/{id}/releases/{version}/status", async (string id, string version,
+            HttpContext context, IAntiforgery antiforgery) =>
+        {
+            if (!await ValidCsrf(context, antiforgery)) return Results.BadRequest("Invalid form token.");
+            var form = await context.Request.ReadFormAsync();
+            try
+            {
+                var updated = store.SetReleaseStatus(id, version, form["status"].ToString());
+                guard.Audit("release-status", context.User.Identity?.Name ?? "unknown",
+                    id + "/" + version + "=" + updated.Status, "ok", context);
+                return Results.Redirect("/admin?notice=status#programs");
+            }
+            catch (ArgumentException ex) { return Error(ex.Message); }
+        }).RequireAuthorization();
         app.MapPost("/admin/programs/{id}/delete", async (string id, HttpContext context, IAntiforgery antiforgery) =>
         {
             if (!await ValidCsrf(context, antiforgery)) return Results.BadRequest("Invalid form token.");
@@ -617,6 +767,24 @@ static class AdminPages
     private static string LocalText(DateTimeOffset value) =>
         TimeZoneInfo.ConvertTime(value, Zone).ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
 
+    // Sensitive pages: no caching, stated here as well as in the global /admin middleware, because
+    // a "view the password" response should not depend on another component staying configured.
+    /// <summary>Drops expired login-failure records. Called from the maintenance timer so the
+    /// dictionary stays bounded by "addresses that failed recently", not "addresses ever seen".</summary>
+    public static void PruneFailedLogins()
+    {
+        var now = DateTimeOffset.UtcNow;
+        foreach (var (key, failures) in FailedLogins)
+            if (failures.Until <= now) FailedLogins.TryRemove(key, out _);
+    }
+    private static IResult NoStore(HttpContext context, IResult inner)
+    {
+        context.Response.Headers.CacheControl = "no-store, no-cache, must-revalidate, max-age=0";
+        context.Response.Headers.Pragma = "no-cache";
+        context.Response.Headers.Expires = "0";
+        return inner;
+    }
+
     private static string UtcText(DateTimeOffset value) =>
         value.ToUniversalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture) + " UTC";
 
@@ -640,6 +808,57 @@ static class AdminPages
             return $"<p class='hint'>当前：永久。填写后按 {zone} 保存，精确到分钟；留空仍表示永久。</p>";
         var expired = user.ExpiresAt <= DateTimeOffset.UtcNow;
         return $"<p class='hint'>当前：{Encode(LocalText(user.ExpiresAt.Value))}（{zone}，对应 {Encode(UtcText(user.ExpiresAt.Value))}）{(expired ? "，已到期" : "")}。留空表示永久；填过去的时间可立即结束该账号。</p>";
+    }
+
+    // Version state for one program: which version the loader offers, and which of the published
+    // ones may still be downloaded / launched. Withdrawn and banned are different promises:
+    // "withdrawn" = stop handing it out, keep letting installed copies run; "banned" = it may not
+    // run at all (the heartbeat stops it within a beat).
+    private static string VersionPanel(ProgramInfo program, IReadOnlyList<Release> releases, string token)
+    {
+        var body = new StringBuilder();
+        body.Append("<div class='versionpanel'><p class='formhead'>版本状态</p>");
+        if (releases.Count == 0)
+        {
+            body.Append("<p class='hint'>还没有发布版本。</p></div>");
+            return body.ToString();
+        }
+        body.Append("<p class='hint'>推荐版本决定加载器下载哪个版本；<strong>撤回</strong>只停止下载（已安装的仍可启动），")
+            .Append("<strong>禁止</strong>连启动也停止（运行中的程序会在下一个心跳退出）。</p>");
+        var recommended = string.IsNullOrEmpty(program.RecommendedVersion) ? null : program.RecommendedVersion;
+        body.Append("<form method='post' action='/admin/programs/").Append(Uri.EscapeDataString(program.Id))
+            .Append("/recommend' class='inlineform'>").Append(Csrf(token))
+            .Append("<label>推荐版本<select name='version'><option value=''>自动（最高的可用版本）</option>");
+        foreach (var release in releases.Where(release => release.Status == "active"))
+            body.Append("<option value='").Append(Encode(release.Version)).Append("'")
+                .Append(release.Version == recommended ? " selected" : "").Append(">")
+                .Append(Encode(release.Version)).Append("</option>");
+        body.Append("</select></label><button class='secondary'>保存推荐版本</button></form>");
+        body.Append("<div class='versionlist'>");
+        foreach (var release in releases)
+        {
+            var path = "/admin/programs/" + Uri.EscapeDataString(program.Id) + "/releases/" +
+                       Uri.EscapeDataString(release.Version) + "/status";
+            var label = release.Status switch
+            {
+                "withdrawn" => "已撤回",
+                "banned" => "已禁止",
+                _ => "可用",
+            };
+            body.Append("<div class='versionrow'><span class='badge status-").Append(release.Status).Append("'>")
+                .Append(Encode(label)).Append("</span><strong>").Append(Encode(release.Version)).Append("</strong>")
+                .Append(release.Version == recommended ? "<span class='badge'>推荐</span>" : "")
+                .Append("<span class='hint'>").Append(Encode(release.Sha256.Length > 12 ? release.Sha256[..12] : release.Sha256)).Append("…</span>");
+            foreach (var (status, text) in new[] { ("active", "恢复可用"), ("withdrawn", "撤回下载"), ("banned", "禁止启动") })
+            {
+                if (release.Status == status) continue;
+                body.Append("<form method='post' action='").Append(path).Append("' class='inlineform'>")
+                    .Append(Csrf(token)).Append("<input type='hidden' name='status' value='").Append(status).Append("'>")
+                    .Append("<button class='secondary'>").Append(text).Append("</button></form>");
+            }
+            body.Append("</div>");
+        }
+        return body.Append("</div></div>").ToString();
     }
 
     private static async Task<bool> ValidCsrf(HttpContext context, IAntiforgery antiforgery)

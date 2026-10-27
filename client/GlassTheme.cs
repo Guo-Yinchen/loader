@@ -199,6 +199,8 @@ internal abstract class GlassSurface : Panel, IGlassSurface
 
 internal sealed class GlassCanvas : GlassSurface
 {
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    internal bool IsContentLayer { get; set; }
     // Page art is rendered into the cached surface, so children inherit it when they
     // repaint their own backdrop instead of erasing it.
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
@@ -206,18 +208,33 @@ internal sealed class GlassCanvas : GlassSurface
 
     protected override void Render(Graphics graphics, Size size)
     {
+        if (IsContentLayer)
+        {
+            GlassTheme.PaintBackdrop(this, graphics);
+            var state = graphics.Save();
+            try { Decorations?.Invoke(graphics, DeviceDpi / 96f); }
+            finally { graphics.Restore(state); }
+            return;
+        }
         graphics.SmoothingMode = SmoothingMode.AntiAlias;
         var bounds = new Rectangle(Point.Empty, size);
         using (var fill = new LinearGradientBrush(bounds, Color.FromArgb(16, 30, 47), GlassTheme.Background, 40f))
             graphics.FillRectangle(fill, bounds);
         GlassTheme.Glow(graphics, new Rectangle(-size.Width / 5, -size.Height / 3, size.Width, size.Height * 3 / 2), Color.FromArgb(75, 39, 137, 144));
         GlassTheme.Glow(graphics, new Rectangle(size.Width / 2, size.Height / 4, size.Width * 3 / 4, size.Height), Color.FromArgb(65, 83, 73, 148));
-        Decorations?.Invoke(graphics, DeviceDpi / 96f);
+        var decorationState = graphics.Save();
+        try { Decorations?.Invoke(graphics, DeviceDpi / 96f); }
+        finally { graphics.Restore(decorationState); }
         using var frame = GlassTheme.Rounded(new RectangleF(0.5f, 0.5f,
             Math.Max(1, size.Width - 1f), Math.Max(1, size.Height - 1f)), 20 * DeviceDpi / 96f);
         using var line = new Pen(Color.FromArgb(75, 158, 208, 225), 1f);
         graphics.DrawPath(line, frame);
     }
+}
+
+internal sealed class GlassLayer : GlassSurface
+{
+    protected override void Render(Graphics graphics, Size size) => GlassTheme.PaintBackdrop(this, graphics);
 }
 
 internal sealed class ChromeButton : Control
@@ -261,23 +278,24 @@ internal sealed class ChromeButton : Control
         var g = e.Graphics;
         GlassTheme.PaintBackdrop(this, g);
         g.SmoothingMode = SmoothingMode.AntiAlias;
+        var scale = DeviceDpi / 96f;
         if (hovered || pressed || Focused)
         {
             using var background = new SolidBrush(close
                 ? Color.FromArgb(pressed ? 180 : 125, 208, 80, 94)
                 : Color.FromArgb(pressed ? 66 : 42, 178, 220, 228));
-            using var shape = GlassTheme.Rounded(new RectangleF(1, 1, Width - 2, Height - 2), 7);
+            using var shape = GlassTheme.Rounded(new RectangleF(1, 1, Width - 2, Height - 2), 7 * scale);
             g.FillPath(background, shape);
         }
-        using var glyph = new Pen(ForeColor, 1.7f) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+        using var glyph = new Pen(ForeColor, 1.7f * scale) { StartCap = LineCap.Round, EndCap = LineCap.Round };
         var x = Width / 2f;
         var y = Height / 2f;
         if (close)
         {
-            g.DrawLine(glyph, x - 5, y - 5, x + 5, y + 5);
-            g.DrawLine(glyph, x + 5, y - 5, x - 5, y + 5);
+            g.DrawLine(glyph, x - 5 * scale, y - 5 * scale, x + 5 * scale, y + 5 * scale);
+            g.DrawLine(glyph, x + 5 * scale, y - 5 * scale, x - 5 * scale, y + 5 * scale);
         }
-        else g.DrawLine(glyph, x - 6, y + 3, x + 6, y + 3);
+        else g.DrawLine(glyph, x - 6 * scale, y + 3 * scale, x + 6 * scale, y + 3 * scale);
         if (Focused) ControlPaint.DrawFocusRectangle(g, new Rectangle(3, 2, Width - 6, Height - 4), ForeColor, BackColor);
         base.OnPaint(e);
     }

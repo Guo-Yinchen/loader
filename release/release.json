@@ -1,0 +1,10 @@
+{
+  "production": {
+    "serverUrl": "https://teamviewer.rm7lwjwtg.nyat.app:24154",
+    "description": "正式发布：公网 HTTPS 地址，分发给用户。由 publish-client.ps1 默认使用。"
+  },
+  "local": {
+    "serverUrl": "http://127.0.0.1:5115",
+    "description": "本机联调：只允许回环地址，产物写入 client-local，不能分发给用户。"
+  }
+}

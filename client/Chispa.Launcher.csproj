@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net10.0-windows</TargetFramework>
@@ -6,9 +6,18 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <ApplicationIcon>../assets/branding/chispa.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- The loader's own version. The server's launcher metadata is compared against it, and
+         publish-client.ps1 can override it with -Version for a real release. -->
+    <Version Condition="'$(Version)' == ''">1.0.0</Version>
+    <!-- 本地开发默认值：回环地址，只用于本机联调。
+         任何分发给用户的产物都必须由 publish-client.ps1 生成：它显式传入 release/release.json
+         里的正式地址，并在打包后运行产物自检，确认真实内嵌地址。 -->
     <ChispaServerUrl Condition="'$(ChispaServerUrl)' == ''">http://127.0.0.1:5115</ChispaServerUrl>
   </PropertyGroup>
   <ItemGroup>
+    <!-- Shared with the server and the signing tool: one definition of the signed statement. -->
+    <Compile Include="../shared/ReleaseSignature.cs" Link="ReleaseSignature.cs" />
     <EmbeddedResource Include="../assets/branding/chispa.ico" LogicalName="Chispa.Brand.chispa.ico" />
     <EmbeddedResource Include="../assets/branding/chispa.png" LogicalName="Chispa.Brand.chispa.png" />
     <EmbeddedResource Include="../assets/branding/chispa-mark.png" LogicalName="Chispa.Brand.chispa-mark.png" />

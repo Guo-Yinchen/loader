@@ -1,4 +1,4 @@
-"""Local service integration smoke test. No real Chispa executable is run."""
+﻿"""Local service integration smoke test. No real Chispa executable is run."""
 
 import hashlib
 import base64
@@ -50,8 +50,57 @@ def main():
         temp = Path(temporary)
         env = os.environ.copy()
         env["CHISPA_SERVER_DATA"] = str(temp / "data")
+        # This suite deliberately signs in many accounts in seconds; limits have a dedicated matrix.
+        env["CHISPA_LIMIT_LOGIN_PER_MINUTE"] = "600"
         env["DOTNET_CLI_HOME"] = str(ROOT / ".tooling/home")
         kwargs = {"env": env, "check": True, "capture_output": True, "text": True}
+
+        # Every release is signed, and the test uses its own throwaway key: the server verifies
+        # uploads against the public half, and the loader (Chispa.Smoke) is pointed at the same
+        # file so its compiled-in trust anchors are replaced for the duration of the test.
+        signer = ROOT / "tools/Chispa.Sign/bin/Release/net10.0/Chispa.Sign.dll"
+        if not signer.exists():
+            raise SystemExit("Build the signing tool first: ./build.ps1")
+        keys = temp / "signing"
+        made = subprocess.run([str(DOTNET), str(signer), "keygen", "--out", str(keys), "--id", "smoke-key"],
+                              env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if made.returncode:
+            raise AssertionError(made.stdout + made.stderr)
+        trust_path = keys / "release-public.json"
+        env["CHISPA_RELEASE_TRUST_KEYS"] = str(trust_path)
+        env["CHISPA_TRUST_KEYS"] = str(trust_path)
+
+        def pack_and_sign(program_id, version, folder, executable, out_dir=None):
+            """Package and sign exactly as the release environment does."""
+            out_dir = out_dir or temp
+            archive = out_dir / f"{program_id}-{version}.zip"
+            signature = out_dir / f"{program_id}-{version}.signature.json"
+            packed = subprocess.run([str(DOTNET), str(signer), "pack", "--source", str(folder),
+                                     "--out", str(archive), "--executable", executable],
+                                    env=env, capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace")
+            if packed.returncode:
+                raise AssertionError(packed.stdout + packed.stderr)
+            signed = subprocess.run([str(DOTNET), str(signer), "sign", "--package", str(archive),
+                                     "--program", program_id, "--version", version, "--executable", executable,
+                                     "--key", str(keys / "release-private.pem"), "--key-id", "smoke-key",
+                                     "--out", str(signature)], env=env, capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace")
+            if signed.returncode:
+                raise AssertionError(signed.stdout + signed.stderr)
+            return archive, signature
+
+        def sign_zip(program_id, version, archive, executable):
+            """Sign an archive that already exists (used for tampering tests)."""
+            signature = archive.with_suffix(".signature.json")
+            signed = subprocess.run([str(DOTNET), str(signer), "sign", "--package", str(archive),
+                                     "--program", program_id, "--version", version, "--executable", executable,
+                                     "--key", str(keys / "release-private.pem"), "--key-id", "smoke-key",
+                                     "--out", str(signature)], env=env, capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace")
+            if signed.returncode:
+                raise AssertionError(signed.stdout + signed.stderr)
+            return signature.read_text(encoding="utf-8")
         added = subprocess.run([str(DOTNET), str(SERVER), "user-add", "testuser"],
                                input="correct horse battery staple\n", **{**kwargs, "check": False})
         if added.returncode:
@@ -78,7 +127,9 @@ def main():
         for name in ("Wardogs.exe", "vmm.dll", "leechcore.dll", "FTD3XX.dll", "info.db"):
             (runtime / name).write_bytes(b"smoke-test-" + name.encode())
         (runtime / "assets/test.txt").write_text("asset", encoding="utf-8")
-        published = subprocess.run([str(DOTNET), str(SERVER), "publish", "chispa", "1.2.3", str(runtime)],
+        archive, signature = pack_and_sign("chispa", "1.2.3", runtime, "Wardogs.exe")
+        published = subprocess.run([str(DOTNET), str(SERVER), "publish", "chispa", "1.2.3",
+                                    str(archive), str(signature)],
                                    **{**kwargs, "check": False})
         if published.returncode:
             raise AssertionError(published.stdout + published.stderr)
@@ -87,7 +138,9 @@ def main():
         helper.mkdir()
         (helper / "Helper.exe").write_bytes(b"smoke-test-helper")
         (helper / "data.txt").write_text("helper data", encoding="utf-8")
-        published = subprocess.run([str(DOTNET), str(SERVER), "publish", "helper", "2.0.0", str(helper)],
+        archive, signature = pack_and_sign("helper", "2.0.0", helper, "Helper.exe")
+        published = subprocess.run([str(DOTNET), str(SERVER), "publish", "helper", "2.0.0",
+                                    str(archive), str(signature)],
                                    **{**kwargs, "check": False})
         if published.returncode:
             raise AssertionError(published.stdout + published.stderr)
@@ -217,11 +270,10 @@ def main():
                 raise AssertionError("Expired account could authorize launch")
             except urllib.error.HTTPError as error:
                 assert error.code == 401
-            try:
-                request(base + "/api/v1/programs", token=expiring_token)
-                raise AssertionError("Expired user's existing session remained valid")
-            except urllib.error.HTTPError as error:
-                assert error.code == 401
+            with request(base + "/api/v1/programs", token=expiring_token) as response:
+                assert response.status == 200  # expired subscriptions may still browse the library
+            with request(base + "/api/v1/session", token=expiring_token) as response:
+                assert datetime.fromisoformat(json.load(response)["accountExpiresAt"]) < datetime.now(timezone.utc)
 
             permanent_form = urllib.parse.urlencode({
                 "__RequestVerificationToken": form_token(admin_page), "expiryDate": "",
@@ -282,17 +334,20 @@ def main():
             except urllib.error.HTTPError as error:
                 assert error.code == 404
 
-            def upload_package(payload):
+            def upload_package(program_id, version, payload, signature_text):
                 boundary = "chispa-smoke-boundary"
                 fields = {
                     "__RequestVerificationToken": form_token(admin_page),
-                    "programId": "third", "version": "1.0.0",
+                    "programId": program_id, "version": version,
                 }
                 body = bytearray()
                 for name, value in fields.items():
                     body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode())
                 body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"package\"; filename=\"runtime.zip\"\r\nContent-Type: application/zip\r\n\r\n".encode())
                 body.extend(payload)
+                if signature_text is not None:
+                    body.extend(f"\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"signature\"; filename=\"signature.json\"\r\nContent-Type: application/json\r\n\r\n".encode())
+                    body.extend(signature_text.encode())
                 body.extend(f"\r\n--{boundary}--\r\n".encode())
                 req = urllib.request.Request(base + "/admin/releases", data=bytes(body),
                     headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
@@ -305,11 +360,18 @@ def main():
                     archive.writestr(filename, b"smoke-test-exe")
                 return buffer.getvalue()
 
-            rejected = upload_package(make_zip("Wrong.exe"))
-            assert "ZIP 顶层必须包含 Third.exe" in rejected
+            wrong_zip = temp / "wrong.zip"
+            wrong_zip.write_bytes(make_zip("Wrong.exe"))
+            # The signing tool refuses to sign a package without its entry EXE at the top level,
+            # so a "wrong" package cannot even be signed - which is the first line of defence.
+            unsigned = upload_package("third", "1.0.0", make_zip("Third.exe"), None)
+            assert "请同时上传签名文件" in unsigned, unsigned
             with request(base + "/api/v1/programs", token=token) as response:
                 assert len(json.load(response)) == 3
-            uploaded = upload_package(make_zip("Third.exe"))
+            good_zip = temp / "third-1.0.0.zip"
+            good_zip.write_bytes(make_zip("Third.exe"))
+            signature_text = sign_zip("third", "1.0.0", good_zip, "Third.exe")
+            uploaded = upload_package("third", "1.0.0", good_zip.read_bytes(), signature_text)
             assert "最新版本 1.0.0" in uploaded
             with request(base + "/api/v1/programs/third/releases/latest", token=token) as response:
                 third_release = json.load(response)
@@ -324,8 +386,12 @@ def main():
                 archive.writestr("assets/data.bin", os.urandom(5 * 1024 * 1024))
             payload = large.getvalue()
             csrf_header = {"X-CSRF-TOKEN": form_token(admin_page)}
+            large_archive = temp / "third-1.0.1.zip"
+            large_archive.write_bytes(payload)
+            large_signature = sign_zip("third", "1.0.1", large_archive, "Third.exe")
             start_request = urllib.request.Request(base + "/admin/uploads",
-                data=json.dumps({"programId": "third", "version": "1.0.1", "size": len(payload)}).encode(),
+                data=json.dumps({"programId": "third", "version": "1.0.1", "size": len(payload),
+                                 "signature": large_signature}).encode(),
                 headers={**csrf_header, "Content-Type": "application/json"})
             with browser.open(start_request) as response:
                 upload_session = json.load(response)
@@ -518,9 +584,17 @@ def main():
             assert "密码已更新" in admin_page
             saved_users = users_path.read_text()
             assert "a brand new password" not in saved_users
-            revealed = post_admin("/admin/users/minuteuser/password/view", {})
+            # Viewing a password now needs a fresh admin re-authentication; that is the point of
+            # the step-up, so the smoke test walks the real two-step path.
+            import re as _re
+            stepup = post_admin("/admin/users/minuteuser/password/stepup", {"adminPassword": "another excellent admin password"})
+            grant = _re.search(r"name='grant' value='([^']+)'", stepup)
+            assert grant is not None, stepup[:200]
+            revealed = post_admin("/admin/users/minuteuser/password/view", {"grant": grant.group(1)})
             assert "a brand new password" in revealed
-            legacy_reveal = post_admin("/admin/users/testuser/password/view", {})
+            stepup = post_admin("/admin/users/testuser/password/stepup", {"adminPassword": "another excellent admin password"})
+            grant = _re.search(r"name='grant' value='([^']+)'", stepup)
+            legacy_reveal = post_admin("/admin/users/testuser/password/view", {"grant": grant.group(1)})
             assert "旧密码无法还原" in legacy_reveal
             try:
                 request(base + "/api/v1/programs", token=minute_token)
@@ -540,48 +614,63 @@ def main():
                 "expiry": (datetime.now().astimezone() - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M")})
             assert "已到期" in admin_page
             try:
-                request(base + "/api/v1/programs", token=minute_token)
-                raise AssertionError("Expired session kept working after a minute-precision expiry")
+                request(base + "/api/v1/programs/chispa/releases/latest", token=minute_token)
+                raise AssertionError("Expired subscription could access a release after a minute-precision expiry")
             except urllib.error.HTTPError as error:
                 assert error.code == 401
             admin_page = post_admin("/admin/users/minuteuser/expiry", {"expiry": ""})
             assert "永久" in admin_page
 
-            # ZIP uploads tolerate a wrapper folder, backslashes and OS junk files.
-            def upload(program_id, version, entries):
+            # Signature policy. The server no longer repairs or normalises an uploaded ZIP, because
+            # rewriting bytes would break the signature: a package that needs repairing has to be
+            # rebuilt with the signing tool, and one that was tampered with after signing is refused.
+            def upload(program_id, version, entries, signature="signed", name="Third.exe"):
                 buffer = io.BytesIO()
                 with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-                    for name, data in entries.items():
-                        archive.writestr(name, data)
-                boundary = "chispa-smoke-upload"
-                body = bytearray()
-                for name, value in {"__RequestVerificationToken": form_token(admin_page),
-                                    "programId": program_id, "version": version}.items():
-                    body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode())
-                body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"package\"; filename=\"runtime.zip\"\r\nContent-Type: application/zip\r\n\r\n".encode())
-                body.extend(buffer.getvalue())
-                body.extend(f"\r\n--{boundary}--\r\n".encode())
-                request_object = urllib.request.Request(base + "/admin/releases", data=bytes(body),
-                    headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
-                with browser.open(request_object) as response:
-                    return response.read().decode("utf-8")
+                    for entry_name, data in entries.items():
+                        archive.writestr(entry_name, data)
+                archive_path = temp / f"upload-{program_id}-{version}.zip"
+                archive_path.write_bytes(buffer.getvalue())
+                if signature == "signed":
+                    signature = sign_zip(program_id, version, archive_path, name)
+                return upload_package(program_id, version, buffer.getvalue(), signature)
 
-            admin_page = upload("third", "1.1.0", {"Third/Third.exe": b"wrapped-exe",
-                                                   "Third/assets/data.bin": b"payload"})
-            assert "最新版本 1.1.0" in admin_page
-            with request(base + "/api/v1/programs/third/releases/1.1.0/package", token=account_tokens["betauser"]) as response:
-                with zipfile.ZipFile(io.BytesIO(response.read())) as archive:
-                    assert sorted(archive.namelist()) == ["Third.exe", "assets/data.bin"]
-            admin_page = upload("third", "1.2.0", {"Third.exe": b"root-exe",
-                                                   "Thumbs.db": b"junk", "__MACOSX/._Third.exe": b"junk"})
-            assert "最新版本 1.2.0" in admin_page
-            with request(base + "/api/v1/programs/third/releases/1.2.0/package", token=account_tokens["betauser"]) as response:
-                with zipfile.ZipFile(io.BytesIO(response.read())) as archive:
-                    assert sorted(archive.namelist()) == ["Third.exe"]
-            admin_page = upload("third", "1.3.0", {"outer\\Third.exe": b"backslash"})
-            assert "最新版本 1.3.0" in admin_page
-            admin_page = upload("third", "1.4.0", {"top/middle/Third.exe": b"too deep"})
-            assert "ZIP 顶层必须包含 Third.exe" in admin_page and "middle" in admin_page
+            # A wrapped folder cannot be signed by the tool in the first place, and a signature
+            # fabricated over the raw bytes is what a compromised server would try: either way the
+            # package is refused and no release appears.
+            wrapped = io.BytesIO()
+            with zipfile.ZipFile(wrapped, "w") as archive:
+                archive.writestr("Third/Third.exe", b"wrapped-exe")
+                archive.writestr("Third/assets/data.bin", b"payload")
+            wrapped_path = temp / "wrapped.zip"
+            wrapped_path.write_bytes(wrapped.getvalue())
+            tool = subprocess.run([str(DOTNET), str(signer), "sign", "--package", str(wrapped_path),
+                                   "--program", "third", "--version", "1.1.0", "--executable", "Third.exe",
+                                   "--key", str(keys / "release-private.pem"), "--key-id", "smoke-key",
+                                   "--out", str(temp / "wrapped.signature.json")],
+                                  env=env, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace")
+            assert tool.returncode != 0 and "入口文件" in (tool.stderr + tool.stdout), tool.stdout + tool.stderr
+            admin_page = upload("third", "1.2.0", {"Third.exe": b"root-exe", "Thumbs.db": b"junk"},
+                                signature="signed")
+            assert "系统垃圾文件" in admin_page, admin_page
+            admin_page = upload("third", "1.3.0", {"top/middle/Third.exe": b"too deep"}, signature=None)
+            assert "请同时上传签名文件" in admin_page, admin_page
+            # Tampering after signing: same manifest, different bytes.
+            tampered = io.BytesIO()
+            with zipfile.ZipFile(tampered, "w") as archive:
+                archive.writestr("Third.exe", b"original-exe")
+            tampered_path = temp / "tampered.zip"
+            tampered_path.write_bytes(tampered.getvalue())
+            tampered_signature = sign_zip("third", "1.4.0", tampered_path, "Third.exe")
+            swapped = io.BytesIO()
+            with zipfile.ZipFile(swapped, "w") as archive:
+                archive.writestr("Third.exe", b"swapped-exe")
+            admin_page = upload("third", "1.4.0", {"Third.exe": b"swapped-exe"},
+                                signature=tampered_signature)
+            assert "签名" in admin_page or "哈希" in admin_page, admin_page
+            # Nothing was published: the tampered release directory does not exist at all.
+            assert not (temp / "data/programs/third/releases/1.4.0").exists()
 
             # Deleting a program removes its packages and prunes account scopes.
             assert (temp / "data/programs/third").exists()
@@ -619,7 +708,7 @@ def main():
             print("PASS: metrics, program editing, beta and scoped account access")
             print("PASS: launch authorization checks expiry and live permissions; logout revokes token")
             print("PASS: expiry keeps minutes, admin password reset needs confirmation and revokes sessions")
-            print("PASS: ZIP uploads accept wrapper folders and drop OS junk; deleting programs prunes scopes and packages")
+            print("PASS: unsigned, wrapped and post-signing-tampered uploads are refused; deleting programs prunes scopes and packages")
         finally:
             server.terminate()
             server.wait(timeout=5)
