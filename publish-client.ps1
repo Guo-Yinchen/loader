@@ -341,7 +341,7 @@ if ($VerifyArtifact) {
 }
 
 if ($OutputDirectory) { $output = Assert-SafeOutput (Resolve-PathFromRoot $OutputDirectory) }
-elseif ($Profile -eq 'production') { $output = Assert-SafeOutput (Join-Path $root '.local/distribution/client') }
+elseif ($Profile -eq 'production') { $output = Assert-SafeOutput (Join-Path $root 'dist/client') }
 else { $output = Assert-SafeOutput (Join-Path $root '.local/distribution/client-local') }
 
 # ---------------------------------------------------------------- build to staging

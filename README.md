@@ -1,5 +1,7 @@
 # Chispa 加载器
 
+当前成品：[客户端与独立服务端 1.0.4](https://github.com/Guo-Yinchen/loader/releases/tag/v1.0.4)；[软件 1.2.4](https://github.com/Guo-Yinchen/Wardogs/releases/tag/v1.2.4)。本地统一放在 `dist/client`、`dist/server`、`dist/software`，见 [工作区与发布说明](docs/workspace.md)。
+
 > 2026-10-27：[加载器 1.0.4 默认管理员启动](docs/launcher-admin-1.0.4.md)。双击时自动请求管理员权限，确认 Windows UAC 后启动。
 
 > 2026-10-27：[加载器 1.0.3 界面修复](docs/launcher-ui-1.0.3.md)。窗口按钮移入主矩形，账户信息分行独立显示，统一文字测量和缓冲绘制，修复文字裁切及 DPI 留白不足。
