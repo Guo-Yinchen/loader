@@ -22,6 +22,10 @@ param(
     [string]$ReleaseTrustKeys = '',
     [string]$ServiceDirectory = '',
     [string]$ServerDll = '',
+    [string]$LauncherVersion = '',
+    [string]$LauncherMinimum = '',
+    [string]$LauncherDownloadUrl = '',
+    [string]$LauncherNotes = '',
     [System.Management.Automation.PSCredential]$Credential,
     [ValidateSet('AtStartup', 'AtLogOn')]
     [string]$Trigger = 'AtLogOn',
@@ -96,6 +100,10 @@ Set-Location '$(Quote-Literal $root)'
 `$env:CHISPA_TRUSTED_PROXIES = '$(Quote-Literal $TrustedProxies)'
 `$env:CHISPA_PRODUCTION = '$productionValue'
 `$env:CHISPA_RELEASE_TRUST_KEYS = '$(Quote-Literal $ReleaseTrustKeys)'
+`$env:CHISPA_LAUNCHER_VERSION = '$(Quote-Literal $LauncherVersion)'
+`$env:CHISPA_LAUNCHER_MINIMUM = '$(Quote-Literal $LauncherMinimum)'
+`$env:CHISPA_LAUNCHER_DOWNLOAD_URL = '$(Quote-Literal $LauncherDownloadUrl)'
+`$env:CHISPA_LAUNCHER_NOTES = '$(Quote-Literal $LauncherNotes)'
 `$env:DOTNET_CLI_HOME = '$(Quote-Literal (Join-Path $root '.tooling/home'))'
 `$env:DOTNET_NOLOGO = '1'
 & '$(Quote-Literal $dotnet)' '$(Quote-Literal $serverDll)'
