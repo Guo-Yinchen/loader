@@ -1,4 +1,4 @@
-# Chispa Server 1.0.4 — Windows x64
+# Chispa Server 1.0.5 — Windows x64
 
 此包自带 .NET 运行时，无需安装 SDK。解压后先在该目录打开终端：
 
