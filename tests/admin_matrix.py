@@ -36,6 +36,7 @@ if not DOTNET.exists():
 pointer = ROOT / ".local/current-server-build.txt"
 SERVER = (ROOT / ".local/server-builds" / pointer.read_text().strip() / "Chispa.Server.dll"
           if pointer.exists() else ROOT / "server/bin/Release/net10.0/Chispa.Server.dll")
+SERVER = Path(os.environ.get('CHISPA_TEST_SERVER', str(SERVER)))
 ADMIN = "manager"
 ADMIN_PASSWORD = "an excellent admin password"
 USER = "alice"

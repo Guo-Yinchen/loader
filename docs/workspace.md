@@ -2,10 +2,12 @@
 
 ## 当前成品
 
+1.0.5 的分程序激活累加、Beta 通行证与旧版本删除规则见 [授权与版本维护](entitlements-and-version-deletion.md)。
+
 | 组件 | 版本 | 本地位置 | GitHub |
 |---|---|---|---|
-| 客户端 | 1.0.4 | `dist/client/Chispa.Launcher.exe` | [loader v1.0.4](https://github.com/Guo-Yinchen/loader/releases/tag/v1.0.4) |
-| 独立服务端 | 1.0.4 | `dist/server/Chispa.Server-1.0.4-win-x64.zip` | 同上，含运行时及启动说明 |
+| 客户端 | 1.0.5 | `dist/client/Chispa.Launcher.exe` | [loader v1.0.5](https://github.com/Guo-Yinchen/loader/releases/tag/v1.0.5) |
+| 独立服务端 | 1.0.5 | `dist/server/Chispa.Server-1.0.5-win-x64.zip` | 同上，含运行时及启动说明 |
 | 软件 | 1.2.4 | `dist/software/Wardogs-1.2.4.zip` | [Wardogs v1.2.4](https://github.com/Guo-Yinchen/Wardogs/releases/tag/v1.2.4) |
 
 源码分别提交到 loader 与 Wardogs。成品不提交进 Git，发布到 Releases，附 SHA256SUMS；软件包附原始签名，不重新压缩或覆盖原版本。
@@ -25,7 +27,7 @@
 
 ```powershell
 ./build.ps1
-./publish-client.ps1                     # 默认 1.0.4，输出 dist/client
+./publish-client.ps1                     # 默认 1.0.5，输出 dist/client
 ./publish-server.ps1                     # 自带运行时，输出 dist/server
 ./tools/clean-workspace.ps1               # 只预览
 ./tools/clean-workspace.ps1 -Apply        # 清理白名单内的旧构建与缓存

@@ -98,9 +98,9 @@ internal sealed partial class LauncherForm : Form
         accountTimer.Tick += (_, _) =>
         {
             UpdateAccountTime();
-            if (displayedExpired != api.AccountExpired)
+            if (displayedExpired != SelectedExpired)
             {
-                displayedExpired = api.AccountExpired;
+                displayedExpired = SelectedExpired;
                 UpdateControls();
             }
         };
@@ -433,6 +433,7 @@ internal sealed partial class LauncherForm : Form
             if (card.IsSelected != isSelected) { card.IsSelected = isSelected; card.Invalidate(); }
         }
         UpdateControls();
+        UpdateAccountTime();
     }
 
     private Task CheckVersionAsync() => CheckVersionAsync(false);
@@ -440,10 +441,10 @@ internal sealed partial class LauncherForm : Form
     private async Task CheckVersionAsync(bool silent)
     {
         if (selected is null) return;
-        if (api.AccountExpired)
+        if (SelectedExpired)
         {
             latest = null;
-            SetStatus("账户授权已到期，可登录查看账户；续期后点击“同步程序”即可继续使用。");
+            SetStatus("此程序授权已到期，可兑换包含此程序的激活码续期。");
             UpdateControls();
             return;
         }
@@ -521,30 +522,42 @@ internal sealed partial class LauncherForm : Form
         password.Enabled = !busy;
         remember.Enabled = !busy;
         programCards.Enabled = !busy;
-        refresh.Enabled = !busy && !api.AccountExpired && selected?.HasRelease != false && selected is not null;
-        install.Enabled = !busy && !api.AccountExpired && selected?.HasRelease != false && selected is not null && latest is not null;
+        refresh.Enabled = !busy && !SelectedExpired && selected?.HasRelease != false && selected is not null;
+        install.Enabled = !busy && !SelectedExpired && selected?.HasRelease != false && selected is not null && latest is not null;
         install.Text = installed is not null && installed == latest?.Version ? "重新安装 / 修复" : "下载 / 更新";
         ((GlassButton)install).Primary = installed is null || installed != latest?.Version;
         ((GlassButton)launch).Primary = installed is not null;
-        launch.Enabled = !busy && !api.AccountExpired && selected?.HasRelease != false && selected is not null && installed is not null;
+        launch.Enabled = !busy && !SelectedExpired && selected?.HasRelease != false && selected is not null && installed is not null;
     }
+
+    private bool SelectedExpired => selected?.HasEntitlement == true
+        ? selected.EntitlementExpiresAt is { } expiry && expiry <= api.ServerNow : api.AccountExpired;
 
     private void UpdateAccountTime()
     {
         if (api.Account is not { } account) { accountTime.Text = accountExpiry.Text = ""; return; }
         welcome.Text = "欢迎，" + account.Username;
-        if (account.AccountExpiresAt is not { } expiry)
+        if (account.ProgramExpiries?.Count == 0)
         {
-            accountTime.Text = "剩余时间：永久";
-            accountExpiry.Text = "到期时间：永久有效";
+            accountTime.Text = "尚未开通稳定程序";
+            accountExpiry.Text = "可兑换程序激活码开通授权";
+            accountTime.ForeColor = Muted;
+            return;
+        }
+        var deadline = selected?.HasEntitlement == true ? selected.EntitlementExpiresAt : account.AccountExpiresAt;
+        var label = selected?.HasEntitlement == true ? "此程序" : "账户";
+        if (deadline is not { } expiry)
+        {
+            accountTime.Text = label + "剩余时间：永久";
+            accountExpiry.Text = label + "到期时间：永久有效";
             accountTime.ForeColor = Muted;
             return;
         }
         var remaining = expiry - api.ServerNow;
         var countdown = remaining <= TimeSpan.Zero ? "已到期"
             : $"{(long)remaining.TotalDays} 天 {remaining.Hours:00}:{remaining.Minutes:00}:{remaining.Seconds:00}";
-        accountTime.Text = $"剩余时间：{countdown}";
-        accountExpiry.Text = $"到期时间：{expiry.ToLocalTime():yyyy-MM-dd HH:mm:ss}（本地时间）";
+        accountTime.Text = $"{label}剩余时间：{countdown}";
+        accountExpiry.Text = $"{label}到期时间：{expiry.ToLocalTime():yyyy-MM-dd HH:mm:ss}（本地时间）";
         accountTime.ForeColor = remaining <= TimeSpan.Zero ? Color.Salmon : Muted;
     }
 

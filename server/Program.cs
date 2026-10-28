@@ -336,7 +336,8 @@ app.MapGet("/api/v1/session", (HttpContext context) =>
 {
     var user = CurrentUser(context, allowExpired: true);
     return user is null ? Results.Unauthorized() : Results.Ok(new {
-        username = user.Username, accountExpiresAt = user.ExpiresAt, serverTime = DateTimeOffset.UtcNow });
+        username = user.Username, accountExpiresAt = user.ExpiresAt, serverTime = DateTimeOffset.UtcNow,
+        programExpiries = user.ProgramExpiries });
 });
 
 app.MapPost("/api/v1/register", (RegistrationRequest request) =>
@@ -356,7 +357,8 @@ app.MapPost("/api/v1/activation/redeem", (ActivationRequest request, HttpContext
     try
     {
         var user = store.RedeemActivation(current.Username, current.Hash, request.Code);
-        return Results.Ok(new { username = user.Username, accountExpiresAt = user.ExpiresAt, serverTime = DateTimeOffset.UtcNow });
+        return Results.Ok(new { username = user.Username, accountExpiresAt = user.ExpiresAt, serverTime = DateTimeOffset.UtcNow,
+            programExpiries = user.ProgramExpiries });
     }
     catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
 });
@@ -582,16 +584,16 @@ record Session(string Username, string UserHash, DateTimeOffset ExpiresAt);
 record LoginFailures(int Count, DateTimeOffset Until);
 record UserRecord(string Username, string Salt, string Hash, DateTimeOffset? ExpiresAt = null,
     string AccessMode = "all", string[]? ProgramIds = null, bool BetaAccess = false,
-    string? PasswordCiphertext = null);
+    string? PasswordCiphertext = null, Dictionary<string, DateTimeOffset?>? ProgramExpiries = null);
 record UserSummary(string Username, DateTimeOffset? ExpiresAt, string AccessMode, string[] ProgramIds,
-    bool BetaAccess, bool PasswordAvailable);
+    bool BetaAccess, bool PasswordAvailable, Dictionary<string, DateTimeOffset?>? ProgramExpiries = null);
 record AdminRecord(string Username, string Salt, string Hash);
 record ProgramInfo(string Id, string Name, string Executable, string? Icon = null,
     bool IsBeta = false, string? ParentProgramId = null, bool HasRelease = false,
     // Which version the loader should offer. Null means "the highest active version". Pointing it
     // at an older build is the rollback path after a bad release; pointing it at nothing (or at a
     // version that disappeared) falls back to the highest active one instead of breaking the program.
-    string? RecommendedVersion = null);
+    string? RecommendedVersion = null, DateTimeOffset? EntitlementExpiresAt = null, bool HasEntitlement = false);
 record Release(string ProgramId, string Version, string Executable, string Sha256, long Size,
     Dictionary<string, string>? Binaries = null, string? Signature = null, string? SignatureKeyId = null,
     // "active" (default), "withdrawn" (no longer downloadable, still launchable) or "banned"
@@ -681,7 +683,7 @@ sealed partial class Store
             var users = Read<List<UserRecord>>(Path.Combine(root, "users.json")) ?? [];
             var user = users.FirstOrDefault(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
             return user is not null && user.Hash == userHash &&
-                (allowExpired || user.ExpiresAt is null || user.ExpiresAt > DateTimeOffset.UtcNow) ? user : null;
+                (allowExpired || HasActiveSubscription(user)) ? user : null;
         }
     }
 
@@ -692,7 +694,7 @@ sealed partial class Store
             return (Read<List<UserRecord>>(Path.Combine(root, "users.json")) ?? [])
                 .Select(u => new UserSummary(u.Username, u.ExpiresAt,
                     u.AccessMode == "beta" ? "all" : u.AccessMode, u.ProgramIds ?? [],
-                    u.BetaAccess || u.AccessMode == "beta", u.PasswordCiphertext is not null))
+                    u.BetaAccess || u.AccessMode == "beta", u.PasswordCiphertext is not null, Entitlements(u)))
                 .OrderBy(u => u.Username, StringComparer.OrdinalIgnoreCase).ToArray();
         }
     }
@@ -716,7 +718,9 @@ sealed partial class Store
             var users = Read<List<UserRecord>>(path) ?? [];
             var index = users.FindIndex(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
             if (index < 0) throw new ArgumentException("User not found.");
-            users[index] = users[index] with { ExpiresAt = expiresAt };
+            var user = users[index];
+            users[index] = user with { ExpiresAt = expiresAt,
+                ProgramExpiries = user.ProgramExpiries?.ToDictionary(p => p.Key, _ => expiresAt) };
             WriteAtomic(path, users);
         }
     }
@@ -753,22 +757,35 @@ sealed partial class Store
             var users = Read<List<UserRecord>>(path) ?? [];
             var index = users.FindIndex(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
             if (index < 0) throw new ArgumentException("User not found.");
-            users[index] = users[index] with { AccessMode = accessMode, ProgramIds = ids, BetaAccess = betaAccess };
+            var user = users[index];
+            if (user.ProgramExpiries is null)
+                users[index] = user with { AccessMode = accessMode, ProgramIds = ids, BetaAccess = betaAccess };
+            else
+            {
+                var selected = accessMode == "all" ? ListAllPrograms().Where(p => !p.IsBeta).Select(p => p.Id) : ids;
+                var expiries = selected.ToDictionary(id => id,
+                    id => user.ProgramExpiries.TryGetValue(id, out var expiry) ? expiry : user.ExpiresAt);
+                users[index] = WithEntitlements(user with { BetaAccess = betaAccess }, expiries);
+            }
             WriteAtomic(path, users);
         }
     }
 
-    public bool CanAccess(UserRecord user, string programId)
+    public bool CanAccess(UserRecord user, string programId) => HasProgramScope(user, programId) &&
+        (ProgramExpiry(user, programId) is not { } expiry || expiry > DateTimeOffset.UtcNow);
+
+    private bool HasProgramScope(UserRecord user, string programId)
     {
         var program = GetProgram(programId);
         if (program is null) return false;
         if (program.IsBeta && !(user.BetaAccess || user.AccessMode == "beta")) return false;
         var scopeId = program.IsBeta ? program.ParentProgramId ?? program.Id : program.Id;
+        if (program.IsBeta && program.ParentProgramId is null) return false;
+        if (user.ProgramExpiries is { } expiries) return expiries.ContainsKey(scopeId);
         return user.AccessMode switch
         {
             "beta" => true,
-            "single" or "multiple" => (user.ProgramIds ?? []).Contains(scopeId, StringComparer.Ordinal) ||
-                (user.ProgramIds ?? []).Contains(programId, StringComparer.Ordinal),
+            "single" or "multiple" => (user.ProgramIds ?? []).Contains(scopeId, StringComparer.Ordinal),
             "all" => true,
             _ => false
         };
@@ -915,7 +932,15 @@ sealed partial class Store
             {
                 var user = users[index];
                 var ids = user.ProgramIds ?? [];
-                if (!ids.Contains(id, StringComparer.Ordinal)) continue;
+                if (!ids.Contains(id, StringComparer.Ordinal) && user.ProgramExpiries?.ContainsKey(id) != true) continue;
+                if (user.ProgramExpiries is not null)
+                {
+                    var expiries = new Dictionary<string, DateTimeOffset?>(user.ProgramExpiries);
+                    expiries.Remove(id);
+                    users[index] = WithEntitlements(user, expiries);
+                    usersChanged = true;
+                    continue;
+                }
                 var kept = ids.Where(value => !value.Equals(id, StringComparison.Ordinal)).ToArray();
                 var mode = user.AccessMode;
                 if (mode == "multiple" && kept.Length == 1) mode = "single";
@@ -944,9 +969,10 @@ sealed partial class Store
             .Select(d => Path.GetFileName(d))
             .Where(id => ProgramId.IsMatch(id))
             .Select(GetProgram)
-            .Where(p => p is not null && (user is null || CanAccess(user, p.Id)))
+            .Where(p => p is not null && (user is null || HasProgramScope(user, p.Id)))
             .Cast<ProgramInfo>()
-            .Select(p => p with { HasRelease = Latest(p.Id) is not null })
+            .Select(p => p with { HasRelease = Latest(p.Id) is not null,
+                HasEntitlement = user is not null, EntitlementExpiresAt = user is null ? null : ProgramExpiry(user, p.Id) })
             .OrderByDescending(p => p.HasRelease)
             .ThenBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
             .ToArray();
@@ -1116,9 +1142,9 @@ sealed partial class Store
     public Release SetReleaseStatus(string programId, string version, string status)
     {
         if (!ReleaseStatus.IsKnown(status)) throw new ArgumentException("版本状态无效。");
-        var release = GetRelease(programId, version) ?? throw new ArgumentException("这个版本不存在。");
         lock (gate)
         {
+            var release = GetRelease(programId, version) ?? throw new ArgumentException("这个版本不存在。");
             var directory = Path.Combine(root, "programs", programId, "releases", version);
             var manifest = release with { Signature = null, Status = status };
             WriteAtomic(Path.Combine(directory, "manifest.json"), manifest);
@@ -1128,16 +1154,19 @@ sealed partial class Store
 
     public ProgramInfo SetRecommendedVersion(string programId, string? version)
     {
-        var program = GetProgram(programId) ?? throw new ArgumentException("程序不存在。");
-        if (!string.IsNullOrEmpty(version))
+        lock (gate)
         {
-            var release = GetRelease(programId, version) ?? throw new ArgumentException("这个版本不存在，无法设为推荐版本。");
-            if (!ReleaseStatus.Downloadable(release.Status))
-                throw new ArgumentException("撤回或禁止的版本不能设为推荐版本。");
+            var program = GetProgram(programId) ?? throw new ArgumentException("程序不存在。");
+            if (!string.IsNullOrEmpty(version))
+            {
+                var release = GetRelease(programId, version) ?? throw new ArgumentException("这个版本不存在，无法设为推荐版本。");
+                if (!ReleaseStatus.Downloadable(release.Status))
+                    throw new ArgumentException("撤回或禁止的版本不能设为推荐版本。");
+            }
+            var updated = program with { RecommendedVersion = string.IsNullOrEmpty(version) ? null : version };
+            WriteAtomic(Path.Combine(root, "programs", programId, "program.json"), updated);
+            return updated;
         }
-        var updated = program with { RecommendedVersion = string.IsNullOrEmpty(version) ? null : version };
-        lock (gate) WriteAtomic(Path.Combine(root, "programs", programId, "program.json"), updated);
-        return updated;
     }
 
     public Release? GetRelease(string programId, string version)

@@ -35,6 +35,7 @@ if not DOTNET.exists():
 pointer = ROOT / ".local/current-server-build.txt"
 SERVER = (ROOT / ".local/server-builds" / pointer.read_text().strip() / "Chispa.Server.dll"
           if pointer.exists() else ROOT / "server/bin/Release/net10.0/Chispa.Server.dll")
+SERVER = Path(os.environ.get('CHISPA_TEST_SERVER', str(SERVER)))
 SIGNER = ROOT / "tools/Chispa.Sign/bin/Release/net10.0/Chispa.Sign.dll"
 ADMIN = "manager"
 ADMIN_PASSWORD = "an excellent admin password"
@@ -334,6 +335,53 @@ def main():
             # ---- other program untouched ---------------------------------------------------
             status, latest_other = harness.latest(token, "other")
             check("其他程序的最新版本不受影响", status == 200 and latest_other["version"] == "5.0.0", latest_other)
+
+            # Delete only a non-current release; test both the real button and HTTP guardrails.
+            delete_path = '/admin/programs/chispa/releases/1.1.0/delete'
+            status, _, _ = call(opener, 'POST', harness.base + delete_path)
+            check('删除版本需要CSRF', status == 400)
+            status, _, _ = call(DIRECT, 'POST', harness.base + delete_path)
+            target = harness.data / 'programs/chispa/releases/1.1.0'
+            check('匿名不能删除版本', target.exists())
+            status, _, page = harness.admin_form(opener, admin_token,
+                '/admin/programs/chispa/releases/1.0.0/delete', {})
+            check('自动推荐版本不能删除', '不能删除当前推荐版本'.encode() in page and
+                  (harness.data / 'programs/chispa/releases/1.0.0/package.zip').exists())
+            # 1.1.0 is still explicitly recommended (now banned), so clear that pointer first.
+            status, _, page = harness.admin_form(opener, admin_token, delete_path, {})
+            check('显式推荐指针仍受保护', '不能删除当前推荐版本'.encode() in page and target.exists())
+            harness.admin_form(opener, admin_token, '/admin/programs/chispa/recommend', {'version': ''})
+            status, _, page = call(opener, 'GET', harness.base + '/admin')
+            check('旧版本显示删除按钮', delete_path.encode() in page and '删除旧版本'.encode() in page)
+            # Make the old release launchable and lease it before removal.
+            harness.admin_form(opener, admin_token, '/admin/programs/chispa/recommend', {'version': '1.0.0'})
+            harness.admin_form(opener, admin_token, '/admin/programs/chispa/releases/1.1.0/status', {'status': 'active'})
+            status, _, raw = call(DIRECT, 'POST', harness.base + '/api/v1/programs/chispa/releases/1.1.0/launch-ticket',
+                                  headers={'Authorization': 'Bearer ' + token})
+            old_ticket = json.loads(raw)['ticket']
+            status, _, raw = call(DIRECT, 'POST', harness.base + '/api/v1/launch/redeem',
+                                  headers={'Content-Type': 'application/json'},
+                                  body=json.dumps({'ticket': old_ticket, 'programId': 'chispa', 'version': '1.1.0', 'device': DEVICE}).encode())
+            old_lease = json.loads(raw)['lease']
+            with (target / 'package.zip').open('rb'):
+                status, _, page = harness.admin_form(opener, admin_token, delete_path, {})
+                check('占用中的版本不能删除且保留全部文件', '版本文件正在使用'.encode() in page and
+                      all((target / name).exists() for name in ['package.zip', 'signature.json', 'manifest.json']))
+            status, _, _ = harness.admin_form(opener, admin_token, delete_path, {})
+            check('删除旧版本同时移除包签名清单', status == 200 and not target.exists())
+            status, _, _ = call(DIRECT, 'GET', harness.base + '/api/v1/programs/chispa/releases/1.1.0/package',
+                                 headers={'Authorization': 'Bearer ' + token})
+            check('删除后不能下载', status == 404)
+            status, _, _ = call(DIRECT, 'POST', harness.base + '/api/v1/programs/chispa/releases/1.1.0/launch',
+                                 headers={'Authorization': 'Bearer ' + token})
+            check('删除后不能启动', status == 404)
+            status, _, raw = call(DIRECT, 'POST', harness.base + '/api/v1/launch/heartbeat',
+                                 headers={'Authorization': 'Bearer ' + old_lease, 'X-Chispa-Device': DEVICE})
+            check('删除后运行租约在下一心跳失效', status == 404 and json.loads(raw)['code'] == 'program_unavailable')
+            check('删除后当前版本仍正常', harness.latest(token)[1]['version'] == '1.0.0')
+            check('删除不会影响其他程序', harness.latest(token, 'other')[1]['version'] == '5.0.0')
+            audit = (harness.data / 'admin-audit.log').read_text(encoding='utf-8')
+            check('删除版本写入审计', 'release-delete' in audit and 'chispa/1.1.0' in audit)
 
             # ---- launcher metadata ---------------------------------------------------------
             status, _, body = call(DIRECT, "GET", f"{harness.base}/api/v1/launcher/latest")

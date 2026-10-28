@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([string]$Version = '1.0.4', [string]$OutputDirectory = 'dist/server')
+param([string]$Version = '1.0.5', [string]$OutputDirectory = 'dist/server')
 $ErrorActionPreference = 'Stop'
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid server version.' }
 $root = $PSScriptRoot

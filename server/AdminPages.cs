@@ -189,15 +189,16 @@ static partial class AdminPages
                 foreach (var user in users)
                 {
                     var path = Uri.EscapeDataString(user.Username);
-                    var state = user.ExpiresAt is null ? "永久"
+                    var state = user.ProgramExpiries?.Count == 0 ? "尚未开通稳定程序" : user.ExpiresAt is null ? "含永久授权"
                         : user.ExpiresAt <= DateTimeOffset.UtcNow ? "已到期 " + LocalText(user.ExpiresAt.Value)
-                        : "有效期至 " + LocalText(user.ExpiresAt.Value);
+                        : "最晚有效期至 " + LocalText(user.ExpiresAt.Value);
                     body.Append("<details class='user' data-search='").Append(Encode(user.Username + " " + AccessLabel(user, programs))).Append("'><summary class='userhead'><strong>").Append(Encode(user.Username))
                         .Append("</strong><span>").Append(Encode(state)).Append("</span><span class='badge'>")
                         .Append(Encode(AccessLabel(user, programs))).Append("</span><span class='edit-affordance'>管理账号 ⌄</span></summary><div class='user-editor'>")
+                        .Append(ProgramExpiryForms(user, programs, token))
                         .Append("<form class='expiryform' method='post' action='/admin/users/").Append(path).Append("/expiry'>")
                         .Append(Csrf(token))
-                        .Append("<p class='formhead'>到期时间</p>")
+                        .Append("<p class='formhead'>统一设置全部程序到期时间</p>")
                         .Append("<label>到期时间（本地时间，精确到分钟）<input name='expiry' type='datetime-local' step='60' value='")
                         .Append(Encode(InputText(user.ExpiresAt))).Append("'></label>")
                         .Append(ExpiryHint(user))
@@ -724,6 +725,35 @@ static partial class AdminPages
             }
             catch (ArgumentException ex) { return Error(ex.Message); }
         }).RequireAuthorization();
+        app.MapPost("/admin/users/{username}/programs/{programId}/expiry", async (string username, string programId,
+            HttpContext context, IAntiforgery antiforgery) =>
+        {
+            if (!await ValidCsrf(context, antiforgery)) return Results.BadRequest("Invalid form token.");
+            try
+            {
+                var form = await context.Request.ReadFormAsync();
+                store.SetProgramExpiry(username, programId, ParseExpiry(ExpiryField(form)));
+                guard.Audit("program-expiry", context.User.Identity?.Name ?? "unknown", username + "/" + programId, "ok", context);
+                return Results.Redirect("/admin?notice=updated#accounts");
+            }
+            catch (ArgumentException ex) { return Error(ex.Message); }
+        }).RequireAuthorization();
+
+        app.MapPost("/admin/programs/{id}/releases/{version}/delete", async (string id, string version,
+            HttpContext context, IAntiforgery antiforgery) =>
+        {
+            if (!await ValidCsrf(context, antiforgery)) return Results.BadRequest("Invalid form token.");
+            try
+            {
+                store.DeleteRelease(id, version);
+                guard.Audit("release-delete", context.User.Identity?.Name ?? "unknown", id + "/" + version, "ok", context);
+                return Results.Redirect("/admin?notice=removed#programs");
+            }
+            catch (ArgumentException ex) { return Error(ex.Message); }
+            catch (IOException) { return Error("版本文件正在使用或无法删除，请等下载结束后重试。"); }
+            catch (UnauthorizedAccessException) { return Error("版本文件无法删除，请检查服务器目录权限。"); }
+        }).RequireAuthorization();
+
         app.MapPost("/admin/programs/{id}/delete", async (string id, HttpContext context, IAntiforgery antiforgery) =>
         {
             if (!await ValidCsrf(context, antiforgery)) return Results.BadRequest("Invalid form token.");
@@ -801,6 +831,20 @@ static partial class AdminPages
     private static string ZoneHint() =>
         $"<p class='hint'>到期时间以服务器本地时间填写和显示：{Encode(ZoneLabel())}，两者是同一时刻，客户端登录时按 UTC 校验。</p>";
 
+    private static string ProgramExpiryForms(UserSummary user, IReadOnlyList<ProgramInfo> programs, string token)
+    {
+        if (user.ProgramExpiries is null) return "";
+        var body = new StringBuilder("<p class='formhead'>各程序有效期（Beta 跟随对应稳定程序）</p>");
+        foreach (var (id, expiry) in user.ProgramExpiries.OrderBy(p => p.Key))
+            body.Append("<form method='post' action='/admin/users/").Append(Uri.EscapeDataString(user.Username))
+                .Append("/programs/").Append(Uri.EscapeDataString(id)).Append("/expiry' class='inlineform'>")
+                .Append(Csrf(token)).Append("<label>").Append(Encode(programs.FirstOrDefault(p => p.Id == id)?.Name ?? id))
+                .Append("<input name='expiry' type='datetime-local' step='60' value='").Append(Encode(InputText(expiry)))
+                .Append("'></label><span class='hint'>").Append(Encode(expiry is { } end ? LocalText(end) : "永久"))
+                .Append("</span><button class='secondary'>保存此程序时间</button></form>");
+        return body.ToString();
+    }
+
     private static string ExpiryHint(UserSummary user)
     {
         var zone = Encode(ZoneLabel());
@@ -824,7 +868,7 @@ static partial class AdminPages
             return body.ToString();
         }
         body.Append("<p class='hint'>推荐版本决定加载器下载哪个版本；<strong>撤回</strong>只停止下载（已安装的仍可启动），")
-            .Append("<strong>禁止</strong>连启动也停止（运行中的程序会在下一个心跳退出）。</p>");
+            .Append("<strong>禁止</strong>连启动也停止（运行中的程序会在下一个心跳退出）。删除旧版本会永久移除 ZIP、签名和清单，已安装的该版本也不能再启动；当前推荐版本受保护。</p>");
         var recommended = string.IsNullOrEmpty(program.RecommendedVersion) ? null : program.RecommendedVersion;
         body.Append("<form method='post' action='/admin/programs/").Append(Uri.EscapeDataString(program.Id))
             .Append("/recommend' class='inlineform'>").Append(Csrf(token))
@@ -856,6 +900,12 @@ static partial class AdminPages
                     .Append(Csrf(token)).Append("<input type='hidden' name='status' value='").Append(status).Append("'>")
                     .Append("<button class='secondary'>").Append(text).Append("</button></form>");
             }
+            var current = recommended is not null && releases.Any(r => r.Version == recommended && r.Status == "active")
+                ? recommended : releases.FirstOrDefault(r => r.Status == "active")?.Version;
+            if (release.Version != recommended && release.Version != current)
+                body.Append("<form method='post' action='").Append(path[..^6]).Append("delete' class='inlineform' data-confirm='确定永久删除版本 ")
+                    .Append(Encode(release.Version)).Append("？ZIP、签名和清单将被删除，已安装的此版本也将停止授权。'>")
+                    .Append(Csrf(token)).Append("<button class='danger'>删除旧版本</button></form>");
             body.Append("</div>");
         }
         return body.Append("</div></div>").ToString();

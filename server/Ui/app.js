@@ -55,7 +55,7 @@
       if(button){button.dataset.idleText=button.textContent;button.disabled=true;button.textContent=form.action.endsWith('/releases')?'正在上传并发布…':'正在处理…';}
     });
     const scope=form.querySelector('[name=accessMode]');
-    if(scope){const update=()=>{const choices=form.querySelector('.choices');const hidden=scope.value==='all'||scope.value==='none';if(choices){choices.hidden=hidden;choices.querySelectorAll('input').forEach(input=>input.disabled=hidden);}};scope.addEventListener('change',update);update();}
+    if(scope){const update=()=>{const choices=form.querySelector('.choices');const hidden=scope.value==='all'||scope.value==='none'||scope.value==='beta';if(choices){choices.hidden=hidden;choices.querySelectorAll('input').forEach(input=>input.disabled=hidden);}for(const name of ['days','betaAccess']){const input=form.querySelector('[name='+name+']');if(input)input.closest('label').hidden=scope.value==='beta';}};scope.addEventListener('change',update);update();}
     const beta=form.querySelector('[name=isBeta]'),parent=form.querySelector('[name=parentProgramId]');
     if(beta&&parent){const update=()=>{parent.disabled=!beta.checked;parent.required=beta.checked;parent.closest('label').hidden=!beta.checked;};beta.addEventListener('change',update);update();}
   }

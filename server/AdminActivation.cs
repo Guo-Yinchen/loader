@@ -8,13 +8,13 @@ static partial class AdminPages
     {
         var body = new StringBuilder("""
             <section id='activation' data-view='activation' class='card'><h2>生成激活码</h2>
-            <p class='hint'>在线生成随机激活码，注册时开始计时。同权限续费从现有到期时间或当前时间中较晚者起算。完整激活码仅在生成时下载一次，请妥善保存。</p>
+            <p class='hint'>不同范围的激活码可混合兑换，各程序分别从其到期时间或现在中较晚者起算。全部程序码为兑换时已登记的每个稳定程序各增加所选时长。Beta 通行证不增加时长，只解锁已有稳定授权对应的 Beta。完整激活码仅在生成时下载一次，请妥善保存。</p>
             <form method='post' action='/admin/activation/generate' data-download='true'>
             """).Append(Csrf(token)).Append("""
             <div class='fields'><label>生成数量<input name='count' type='number' min='1' max='100' value='1' required></label>
             <label>授权时长<select name='days'><option value='1'>1 天</option><option value='7'>7 天</option><option value='30' selected>30 天</option><option value='90'>90 天</option><option value='365'>365 天</option><option value='0'>永久</option></select></label>
             <label>兑换截止时间（可留空）<input name='redeemBefore' type='datetime-local'></label></div>
-            <label>程序范围<select name='accessMode'><option value='all'>全部稳定程序</option><option value='single'>单程序</option><option value='multiple'>多程序</option></select></label>
+            <label>程序范围<select name='accessMode'><option value='all'>全部稳定程序</option><option value='single'>单程序</option><option value='multiple'>多程序</option><option value='beta'>仅 Beta 通行证（不计时）</option></select></label>
             <div class='choices'><span>指定稳定程序</span>
             """).Append(ProgramChoices(programs, [])).Append("""
             </div><label class='check'><input type='checkbox' name='betaAccess' value='1'>允许访问 Beta 程序</label>
@@ -29,12 +29,12 @@ static partial class AdminPages
             var state = key.State == "used" ? "已使用" : key.State == "revoked" ? "已作废" :
                 key.RedeemBefore <= DateTimeOffset.UtcNow ? "兑换已过期" : "未使用";
             body.Append("<details class='user'><summary class='userhead'><strong>…")
-                .Append(Encode(key.Hint)).Append("</strong><span>").Append(key.Days == 0 ? "永久" : key.Days + " 天")
+                .Append(Encode(key.Hint)).Append("</strong><span>").Append(key.AccessMode == "beta" ? "通行证" : key.Days == 0 ? "永久" : key.Days + " 天")
                 .Append("</span><span class='badge'>").Append(state).Append("</span><span>")
                 .Append(Encode(key.UsedBy ?? "")).Append("</span></summary><div class='user-editor'><p>编号：")
                 .Append(Encode(key.Id)).Append("</p><p>权限：")
-                .Append(Encode(key.AccessMode == "all" ? "全部稳定程序" : string.Join("、", key.ProgramIds)))
-                .Append(key.BetaAccess ? " + Beta" : "").Append("</p><p>生成时间：")
+                .Append(Encode(key.AccessMode == "beta" ? "Beta 通行证" : key.AccessMode == "all" ? "全部稳定程序" : string.Join("、", key.ProgramIds)))
+                .Append(key.BetaAccess && key.AccessMode != "beta" ? " + Beta" : "").Append("</p><p>生成时间：")
                 .Append(Encode(LocalText(key.CreatedAt))).Append("；兑换截止：")
                 .Append(Encode(key.RedeemBefore is { } cutoff ? LocalText(cutoff) : "不限"))
                 .Append("；使用时间：").Append(Encode(key.UsedAt is { } used ? LocalText(used) : "—")).Append("</p>");

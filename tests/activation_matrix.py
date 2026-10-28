@@ -98,11 +98,12 @@ def main():
             check('concurrent failure leaves no orphan account', sum(u['username'].startswith('race') for u in users()) == 1)
             status, _, _ = form_post(admin, instance.base + '/admin/activation/' + batch[3]['id'] + '/revoke', {'__RequestVerificationToken': csrf})
             check('revoked key cannot register', status == 200 and register('revoked@example.com', batch[3]['code'])[0] == 400)
-            # Expired redemption deadlines and scope mismatch do not consume keys.
+            # Codes can extend one program independently or add a Beta passport.
             scoped = generate(mode='single')[0]
-            check('different scope cannot renew account', api('activation/redeem', {'code': scoped['code']}, token)[0] == 400 and state(scoped)['state'] == 'unused')
+            check('single code renews an all-program account', api('activation/redeem', {'code': scoped['code']}, token)[0] == 200 and state(scoped)['state'] == 'used')
             beta = generate(beta=True)[0]
-            check('different Beta permission cannot renew', api('activation/redeem', {'code': beta['code']}, token)[0] == 400 and state(beta)['state'] == 'unused')
+            check('code can add Beta permission while renewing', api('activation/redeem', {'code': beta['code']}, token)[0] == 200 and state(beta)['state'] == 'used')
+            scoped = generate(mode='single')[0]
             status, _ = register('scoped@example.com', scoped['code'])
             scoped_token = login('scoped@example.com')
             status, catalog = api('programs', token=scoped_token, method='GET')
@@ -114,7 +115,9 @@ def main():
             check('past redemption deadline refused', register('expired-code@example.com', expired['code'])[0] == 400 and state(expired)['state'] == 'unused')
             # Admin expires an account: login remains available, then renewal starts now.
             records = users()
-            next(u for u in records if u['username'] == 'one@example.com')['expiresAt'] = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+            expired_user = next(u for u in records if u['username'] == 'one@example.com')
+            expired_user['expiresAt'] = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+            expired_user['programExpiries'] = {'sample': expired_user['expiresAt']}
             (instance.data / 'users.json').write_text(json.dumps(records))
             token = login('one@example.com')
             daily = generate(days=1)[0]

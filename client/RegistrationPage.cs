@@ -125,18 +125,18 @@ internal sealed partial class LauncherForm
         ShowRegistration();
         redeeming = true;
         registrationTitle.Text = "兑换激活码";
-        registrationHint.Text = "续费需要相同程序范围和 Beta 权限的激活码。\n剩余授权时间会保留，过期账户从现在起算。";
+        registrationHint.Text = "单程序、多程序和全部程序码可混合兑换，时长分别累加。\nBeta 通行证仅解锁已授权稳定程序对应的 Beta。";
         registrationEmail.Text = api.Account?.Username;
         registrationEmail.ReadOnly = true;
         registrationEmailCaption.Text = "账户";
         registrationPasswordCaption.Visible = registrationPassword.Parent!.Visible = false;
-        renewalSummary.Text = api.Account?.AccountExpiresAt is { } expiry
-            ? $"当前到期时间\n{expiry.ToLocalTime():yyyy-MM-dd HH:mm:ss zzz}\n兑换成功后自动更新授权时间。"
-            : "当前授权：永久有效\n无需继续续费。";
+        renewalSummary.Text = api.Account?.ProgramExpiries?.Count == 0 ? "尚未开通稳定程序\n可兑换单程序、多程序或全部程序激活码。" : api.Account?.AccountExpiresAt is { } expiry
+            ? $"账户最晚到期时间\n{expiry.ToLocalTime():yyyy-MM-dd HH:mm:ss zzz}\n各程序时间请在程序库中选中查看。"
+            : "账户含永久授权\n仍可兑换其他程序或 Beta 通行证。";
         renewalSummary.Visible = true;
         registrationPassword.Enabled = false;
         registrationPassword.PlaceholderText = "已登录，续费无需输入密码";
-        registrationStatus.Text = "账户已是永久授权时，不会消耗激活码。";
+        registrationStatus.Text = "已有时长会保留；目标均已永久且无新增权限时不消耗激活码。";
         submitRegistration.Text = "确认兑换";
         registrationBack.Text = "返回程序库";
         registrationCode.Focus();

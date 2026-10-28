@@ -7,7 +7,8 @@ using System.Security.Cryptography;
 namespace Chispa.Launcher;
 
 internal sealed record ProgramInfo(string Id, string Name, string Executable, string? Icon = null,
-    bool IsBeta = false, string? ParentProgramId = null, bool? HasRelease = null)
+    bool IsBeta = false, string? ParentProgramId = null, bool? HasRelease = null,
+    DateTimeOffset? EntitlementExpiresAt = null, bool HasEntitlement = false)
 {
     public override string ToString()
     {
@@ -22,7 +23,8 @@ internal sealed record Release(string ProgramId, string Version, string Executab
     Dictionary<string, string>? Binaries = null, string? Signature = null, string? SignatureKeyId = null);
 internal sealed record LoginResult(string Token, DateTimeOffset ExpiresAt, string? Username = null,
     DateTimeOffset? AccountExpiresAt = null, DateTimeOffset? ServerTime = null);
-internal sealed record AccountInfo(string Username, DateTimeOffset? AccountExpiresAt, DateTimeOffset ServerTime);
+internal sealed record AccountInfo(string Username, DateTimeOffset? AccountExpiresAt, DateTimeOffset ServerTime,
+    Dictionary<string, DateTimeOffset?>? ProgramExpiries = null);
 // Launcher metadata. DownloadUrl is validated before use and only ever opened by the user.
 internal sealed record LauncherRelease(string Version, string? MinimumVersion = null,
     string? DownloadUrl = null, string? Notes = null);

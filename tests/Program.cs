@@ -156,6 +156,7 @@ if (args.Length is 1 or 2 && args[0] == "--preview")
         Application.DoEvents();
     }
     var output = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", ".local"));
+    output = Environment.GetEnvironmentVariable("CHISPA_UI_OUTPUT") ?? output;
     if (layoutScale != 1f) output = Path.Combine(output, "ui-scale-" + layoutScale.ToString(System.Globalization.CultureInfo.InvariantCulture));
     Directory.CreateDirectory(output);
     using (var loginBitmap = new Bitmap(form.Width, form.Height))
@@ -185,6 +186,7 @@ if (args.Length is 1 or 2 && args[0] == "--preview")
     typeof(LauncherForm).GetMethod("MarkSelection", flags)!.Invoke(form, null);
     Application.DoEvents();
     UiChecks.CheckLibrary(form);
+    UiChecks.CheckProgramExpiry(form);
     UiChecks.CheckText(form);
     if (layoutScale == 1f) UiChecks.CheckQuietRefresh(form, previewPrograms);
     if (livePreview)

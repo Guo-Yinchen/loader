@@ -194,13 +194,13 @@ sealed class LaunchGate
             var leaseToken = Token();
             if (leases.Count >= MaxEntries) Sweep(force: true);
             var lease = new LeaseRecord(leaseToken, ticket.Username, ticket.UserHash, ticket.SessionId,
-                request.ProgramId, request.Version, request.Device!, now, LeaseDeadline(now, user.ExpiresAt));
+                request.ProgramId, request.Version, request.Device!, now, LeaseDeadline(now, store.ProgramExpiry(user, request.ProgramId)));
             leases[leaseToken] = lease;
             failures.TryRemove(FailureKey(remote), out _);
             logger.LogInformation("launch lease issued account={Account} program={Program} version={Version} device={Device} remote={Remote}",
                 ticket.Username, request.ProgramId, request.Version, Short(request.Device!), remote);
             return (StatusCodes.Status200OK, new LeaseIssued(leaseToken, lease.ExpiresAt, now,
-                HeartbeatSeconds, LeaseSeconds, ticket.Username, request.ProgramId, request.Version, Api, user.ExpiresAt));
+                HeartbeatSeconds, LeaseSeconds, ticket.Username, request.ProgramId, request.Version, Api, store.ProgramExpiry(user, request.ProgramId)));
 
         }
     }
@@ -251,10 +251,10 @@ sealed class LaunchGate
             }
 
             var now = DateTimeOffset.UtcNow;
-            var extended = lease with { ExpiresAt = LeaseDeadline(now, user.ExpiresAt), LastSeen = now };
+            var extended = lease with { ExpiresAt = LeaseDeadline(now, store.ProgramExpiry(user, lease.ProgramId)), LastSeen = now };
             leases[bearer] = extended;
             return (StatusCodes.Status200OK, new LeaseRenewed(true, extended.ExpiresAt, now, HeartbeatSeconds, LeaseSeconds,
-                user.ExpiresAt));
+                store.ProgramExpiry(user, lease.ProgramId)));
 
         }
     }

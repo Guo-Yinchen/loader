@@ -48,7 +48,8 @@ sealed partial class Store
         if (redeemBefore <= DateTimeOffset.UtcNow) throw new ArgumentException("兑换截止时间必须晚于现在。");
         lock (gate)
         {
-            var ids = ValidateAccess(accessMode, programIds);
+            var ids = accessMode == "beta" ? [] : ValidateAccess(accessMode, programIds);
+            if (accessMode == "beta") { betaAccess = true; days = 0; }
             var keys = Read<List<ActivationKey>>(ActivationPath) ?? [];
             var generated = new List<GeneratedActivation>();
             for (var i = 0; i < count; i++)
@@ -118,12 +119,11 @@ sealed partial class Store
             var keys = Read<List<ActivationKey>>(ActivationPath) ?? [];
             var index = FindRedeemable(keys, code);
             var key = keys[index];
-            ValidateAccess(key.AccessMode, key.ProgramIds);
             var salt = RandomNumberGenerator.GetBytes(16);
             var hash = Rfc2898DeriveBytes.Pbkdf2(password, salt, 310_000, HashAlgorithmName.SHA256, 32);
             var now = DateTimeOffset.UtcNow;
-            var user = new UserRecord(account, Convert.ToBase64String(salt), Convert.ToBase64String(hash),
-                key.Days == 0 ? null : now.AddDays(key.Days), key.AccessMode, key.ProgramIds, key.BetaAccess);
+            var user = ApplyActivation(new UserRecord(account, Convert.ToBase64String(salt), Convert.ToBase64String(hash),
+                now, "none", [], ProgramExpiries: new()), key, now);
             users.Add(user);
             keys[index] = key with { State = "used", UsedBy = account, UsedAt = now };
             CommitActivation(users, keys);
@@ -142,14 +142,8 @@ sealed partial class Store
             var keys = Read<List<ActivationKey>>(ActivationPath) ?? [];
             var index = FindRedeemable(keys, code);
             var key = keys[index];
-            ValidateAccess(key.AccessMode, key.ProgramIds);
-            var mode = user.AccessMode == "beta" ? "all" : user.AccessMode;
-            if (mode != key.AccessMode || (user.BetaAccess || user.AccessMode == "beta") != key.BetaAccess ||
-                !(user.ProgramIds ?? []).Order().SequenceEqual(key.ProgramIds.Order()))
-                throw new ArgumentException("激活码的程序范围和 Beta 权限与账户不一致，请联系管理员。");
-            if (user.ExpiresAt is null) throw new ArgumentException("账户已是永久授权，无需续费；激活码未被使用。");
             var now = DateTimeOffset.UtcNow;
-            user = user with { ExpiresAt = key.Days == 0 ? null : (user.ExpiresAt > now ? user.ExpiresAt.Value : now).AddDays(key.Days) };
+            user = ApplyActivation(user, key, now);
             users[userIndex] = user;
             keys[index] = key with { State = "used", UsedBy = username, UsedAt = now };
             CommitActivation(users, keys);

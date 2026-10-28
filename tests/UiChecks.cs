@@ -152,6 +152,46 @@ internal static class UiChecks
         Console.WriteLine("UI background refresh: enabled state, button paint and card identity preserved.");
     }
 
+    internal static void CheckProgramExpiry(LauncherForm form)
+    {
+        var selectedField = typeof(LauncherForm).GetField("selected", Flags)!;
+        var previous = selectedField.GetValue(form);
+        var api = Field<LauncherApi>(form, "api");
+        var account = api.Account;
+        try
+        {
+            typeof(LauncherApi).GetProperty("Account")!.SetValue(api,
+                new AccountInfo("test", api.ServerNow.AddDays(60), api.ServerNow));
+            foreach (var (deadline, expired) in new[] {
+                ((DateTimeOffset?)api.ServerNow.AddDays(-1), true),
+                ((DateTimeOffset?)api.ServerNow.AddDays(30), false),
+                ((DateTimeOffset?)null, false) })
+            {
+                selectedField.SetValue(form, new ProgramInfo("chispa", "A", "Preview.exe",
+                    HasRelease: true, HasEntitlement: true, EntitlementExpiresAt: deadline));
+                Invoke(form, "MarkSelection");
+                Require(Field<Button>(form, "refresh").Enabled == !expired,
+                    "refresh button follows aggregate expiry instead of selected program");
+                var label = Field<Label>(form, "accountTime").Text;
+                Require(label.StartsWith("此程序"), "per-program expiry label missing");
+                Require(expired ? label.Contains("已到期") : deadline is null ? label.Contains("永久") : !label.Contains("已到期"),
+                    "selected program expiry display incorrect");
+                CheckLibrary(form);
+            }
+            typeof(LauncherApi).GetProperty("Account")!.SetValue(api,
+                new AccountInfo("passport", DateTimeOffset.MinValue, DateTimeOffset.UtcNow, new()));
+            Invoke(form, "UpdateAccountTime");
+            Require(Field<Label>(form, "accountTime").Text.Contains("尚未开通"), "passport-only account shows invalid deadline");
+            Console.WriteLine("UI individual deadlines: expired, active and permanent selections passed.");
+        }
+        finally
+        {
+            typeof(LauncherApi).GetProperty("Account")!.SetValue(api, account);
+            selectedField.SetValue(form, previous);
+            Invoke(form, "MarkSelection");
+        }
+    }
+
     internal static void CheckRegistration(LauncherForm form, string output)
     {
         foreach (var (method, file) in new[] { ("ShowRegistration", "ui-register.png"), ("ShowRedemption", "ui-redeem.png") })
