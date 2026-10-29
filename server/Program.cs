@@ -178,6 +178,11 @@ var metrics = new ServerMetrics();
 // descends from, so restarting this service forces every running program through the loader
 // again instead of leaving a lease behind that nobody re-checked.
 var launch = new LaunchGate(store, app.Logger);
+var diagnostics = new DiagnosticStore(dataRoot);
+using var diagnosticSlots = new SemaphoreSlim(2, 2);
+try { diagnostics.Prune(); }
+catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+{ app.Logger.LogWarning("Could not prune input diagnostic reports at startup"); }
 // The readiness answer is cached so a checker polling every few seconds does not turn a health
 // probe into disk load. The window is configurable because a test has to see the change now.
 var readinessSeconds = int.TryParse(Environment.GetEnvironmentVariable("CHISPA_READINESS_CACHE_SECONDS"),
@@ -224,7 +229,7 @@ app.Use(async (context, next) =>
         context.Response.Headers.CacheControl = "no-store";
     if (context.Request.Path.StartsWithSegments("/admin"))
         context.Response.Headers.ContentSecurityPolicy = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
-    try { await next(); }
+    try { await TrafficMeter.Measure(context, next, metrics); }
     finally { metrics.Record(context.Request.Path, context.Response.StatusCode); }
 });
 // Request budgets and body caps. Registered before authentication so a flood is rejected without
@@ -327,7 +332,7 @@ app.MapPost("/api/v1/session", (Credentials? credentials, HttpContext context) =
     var expires = now.AddHours(12);
     sessions[token] = new Session(user.Username, user.Hash, expires);
     return Results.Ok(new { token, expiresAt = expires, username = user.Username,
-        accountExpiresAt = user.ExpiresAt, serverTime = DateTimeOffset.UtcNow });
+        accountExpiresAt = store.AccountExpiry(user), serverTime = DateTimeOffset.UtcNow });
 });
 
 // An expired subscription can still sign in and inspect its account. Execution and download
@@ -336,8 +341,8 @@ app.MapGet("/api/v1/session", (HttpContext context) =>
 {
     var user = CurrentUser(context, allowExpired: true);
     return user is null ? Results.Unauthorized() : Results.Ok(new {
-        username = user.Username, accountExpiresAt = user.ExpiresAt, serverTime = DateTimeOffset.UtcNow,
-        programExpiries = user.ProgramExpiries });
+        username = user.Username, accountExpiresAt = store.AccountExpiry(user), serverTime = DateTimeOffset.UtcNow,
+        programExpiries = store.EffectiveEntitlements(user) });
 });
 
 app.MapPost("/api/v1/register", (RegistrationRequest request) =>
@@ -345,7 +350,7 @@ app.MapPost("/api/v1/register", (RegistrationRequest request) =>
     try
     {
         var user = store.RegisterAccount(request.Email, request.Password, request.Code);
-        return Results.Ok(new { username = user.Username, accountExpiresAt = user.ExpiresAt });
+        return Results.Ok(new { username = user.Username, accountExpiresAt = store.AccountExpiry(user) });
     }
     catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
 });
@@ -357,8 +362,8 @@ app.MapPost("/api/v1/activation/redeem", (ActivationRequest request, HttpContext
     try
     {
         var user = store.RedeemActivation(current.Username, current.Hash, request.Code);
-        return Results.Ok(new { username = user.Username, accountExpiresAt = user.ExpiresAt, serverTime = DateTimeOffset.UtcNow,
-            programExpiries = user.ProgramExpiries });
+        return Results.Ok(new { username = user.Username, accountExpiresAt = store.AccountExpiry(user), serverTime = DateTimeOffset.UtcNow,
+            programExpiries = store.EffectiveEntitlements(user) });
     }
     catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
 });
@@ -416,7 +421,8 @@ app.MapGet("/api/v1/launch/capabilities", () => Results.Ok(new
     api = launch.Api,
     ticketSeconds = launch.TicketSeconds,
     leaseSeconds = launch.LeaseSeconds,
-    heartbeatSeconds = launch.HeartbeatSeconds
+    heartbeatSeconds = launch.HeartbeatSeconds,
+    diagnosticReports = true
 }));
 
 // Step 1, from the loader: the account was just authenticated on this request, so the ticket
@@ -456,6 +462,28 @@ app.MapPost("/api/v1/launch/heartbeat", (HttpContext context) =>
     var device = context.Request.Headers["X-Chispa-Device"].ToString();
     var (status, body) = launch.Heartbeat(BearerToken(context), string.IsNullOrWhiteSpace(device) ? null : device);
     return Results.Json(body, statusCode: status);
+});
+
+app.MapPost("/api/v1/diagnostics", async (HttpContext context) =>
+{
+    var owner = launch.DiagnosticIdentity(BearerToken(context), context.Request.Headers["X-Chispa-Device"].ToString());
+    if (owner is null) return Results.Unauthorized();
+    if (!diagnosticSlots.Wait(0)) return Results.StatusCode(429);
+    try
+    {
+        DiagnosticRequest? request;
+        try { request = await context.Request.ReadFromJsonAsync<DiagnosticRequest>(); }
+        catch (JsonException) { return Results.BadRequest(new { code = "invalid_diagnostic" }); }
+        var (status, body) = diagnostics.Save(owner, request);
+        return Results.Json(body, statusCode: status);
+    }
+    catch (BadHttpRequestException ex) { return Results.StatusCode(ex.StatusCode); }
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+    {
+        app.Logger.LogWarning("Could not persist an input diagnostic report");
+        return Results.StatusCode(503);
+    }
+    finally { diagnosticSlots.Release(); }
 });
 
 app.MapDelete("/api/v1/launch/lease", (HttpContext context) =>
@@ -545,12 +573,17 @@ var maintenance = new Timer(_ =>
     AdminPages.PruneFailedLogins();
     store.PruneCaches();
     limits.Prune();
+    try { diagnostics.Prune(); }
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+    { app.Logger.LogWarning("Could not prune input diagnostic reports"); }
 }, null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(2));
 app.Lifetime.ApplicationStopping.Register(() => maintenance.Dispose());
 app.MapAdminPages(store, metrics, () => sessions.Values.Count(
     session => session.ExpiresAt > DateTimeOffset.UtcNow &&
         store.UserAllowed(session.Username, session.UserHash)), adminGuard);
 app.MapActivationAdmin(store, adminGuard);
+app.MapOperationsAdmin(store, launch, adminGuard);
+app.MapDiagnostics(diagnostics);
 if (Environment.GetEnvironmentVariable("CHISPA_OPEN_ADMIN") == "1")
 {
     app.Lifetime.ApplicationStarted.Register(() =>
@@ -584,7 +617,8 @@ record Session(string Username, string UserHash, DateTimeOffset ExpiresAt);
 record LoginFailures(int Count, DateTimeOffset Until);
 record UserRecord(string Username, string Salt, string Hash, DateTimeOffset? ExpiresAt = null,
     string AccessMode = "all", string[]? ProgramIds = null, bool BetaAccess = false,
-    string? PasswordCiphertext = null, Dictionary<string, DateTimeOffset?>? ProgramExpiries = null);
+    string? PasswordCiphertext = null, Dictionary<string, DateTimeOffset?>? ProgramExpiries = null,
+    Dictionary<string, long>? BillingOffsets = null);
 record UserSummary(string Username, DateTimeOffset? ExpiresAt, string AccessMode, string[] ProgramIds,
     bool BetaAccess, bool PasswordAvailable, Dictionary<string, DateTimeOffset?>? ProgramExpiries = null);
 record AdminRecord(string Username, string Salt, string Hash);
@@ -593,7 +627,8 @@ record ProgramInfo(string Id, string Name, string Executable, string? Icon = nul
     // Which version the loader should offer. Null means "the highest active version". Pointing it
     // at an older build is the rollback path after a bad release; pointing it at nothing (or at a
     // version that disappeared) falls back to the highest active one instead of breaking the program.
-    string? RecommendedVersion = null, DateTimeOffset? EntitlementExpiresAt = null, bool HasEntitlement = false);
+    string? RecommendedVersion = null, DateTimeOffset? EntitlementExpiresAt = null, bool HasEntitlement = false,
+    DateTimeOffset? BillingPausedAt = null, long BillingPausedTicks = 0);
 record Release(string ProgramId, string Version, string Executable, string Sha256, long Size,
     Dictionary<string, string>? Binaries = null, string? Signature = null, string? SignatureKeyId = null,
     // "active" (default), "withdrawn" (no longer downloadable, still launchable) or "banned"
@@ -652,7 +687,8 @@ sealed partial class Store
             var salt = RandomNumberGenerator.GetBytes(16);
             var hash = Rfc2898DeriveBytes.Pbkdf2(password, salt, 310_000, HashAlgorithmName.SHA256, 32);
             users.Add(new UserRecord(username, Convert.ToBase64String(salt), Convert.ToBase64String(hash),
-                expiresAt, accessMode, ids, betaAccess, passwordProtector.Protect(password)));
+                expiresAt, accessMode, ids, betaAccess, passwordProtector.Protect(password),
+                BillingOffsets: BillingOffsets(ListAllPrograms().Where(p => !p.IsBeta).Select(p => p.Id))));
             WriteAtomic(path, users);
         }
     }
@@ -692,7 +728,7 @@ sealed partial class Store
         lock (gate)
         {
             return (Read<List<UserRecord>>(Path.Combine(root, "users.json")) ?? [])
-                .Select(u => new UserSummary(u.Username, u.ExpiresAt,
+                .Select(u => new UserSummary(u.Username, AccountExpiry(u),
                     u.AccessMode == "beta" ? "all" : u.AccessMode, u.ProgramIds ?? [],
                     u.BetaAccess || u.AccessMode == "beta", u.PasswordCiphertext is not null, Entitlements(u)))
                 .OrderBy(u => u.Username, StringComparer.OrdinalIgnoreCase).ToArray();
@@ -720,7 +756,8 @@ sealed partial class Store
             if (index < 0) throw new ArgumentException("User not found.");
             var user = users[index];
             users[index] = user with { ExpiresAt = expiresAt,
-                ProgramExpiries = user.ProgramExpiries?.ToDictionary(p => p.Key, _ => expiresAt) };
+                ProgramExpiries = user.ProgramExpiries?.ToDictionary(p => p.Key, _ => expiresAt),
+                BillingOffsets = BillingOffsets(ListAllPrograms().Where(p => !p.IsBeta).Select(p => p.Id)) };
             WriteAtomic(path, users);
         }
     }
@@ -758,13 +795,11 @@ sealed partial class Store
             var index = users.FindIndex(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
             if (index < 0) throw new ArgumentException("User not found.");
             var user = users[index];
-            if (user.ProgramExpiries is null)
-                users[index] = user with { AccessMode = accessMode, ProgramIds = ids, BetaAccess = betaAccess };
-            else
             {
+                var existing = Entitlements(user);
                 var selected = accessMode == "all" ? ListAllPrograms().Where(p => !p.IsBeta).Select(p => p.Id) : ids;
                 var expiries = selected.ToDictionary(id => id,
-                    id => user.ProgramExpiries.TryGetValue(id, out var expiry) ? expiry : user.ExpiresAt);
+                    id => existing.TryGetValue(id, out var expiry) ? expiry : AccountExpiry(user));
                 users[index] = WithEntitlements(user with { BetaAccess = betaAccess }, expiries);
             }
             WriteAtomic(path, users);
@@ -931,11 +966,19 @@ sealed partial class Store
             for (var index = 0; index < users.Count; index++)
             {
                 var user = users[index];
+                if (user.BillingOffsets?.ContainsKey(id) == true)
+                {
+                    var offsets = new Dictionary<string, long>(user.BillingOffsets);
+                    offsets.Remove(id);
+                    user = user with { BillingOffsets = offsets };
+                    users[index] = user;
+                    usersChanged = true;
+                }
                 var ids = user.ProgramIds ?? [];
                 if (!ids.Contains(id, StringComparer.Ordinal) && user.ProgramExpiries?.ContainsKey(id) != true) continue;
                 if (user.ProgramExpiries is not null)
                 {
-                    var expiries = new Dictionary<string, DateTimeOffset?>(user.ProgramExpiries);
+                    var expiries = Entitlements(user);
                     expiries.Remove(id);
                     users[index] = WithEntitlements(user, expiries);
                     usersChanged = true;

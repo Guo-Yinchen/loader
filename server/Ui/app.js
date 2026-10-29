@@ -13,6 +13,7 @@
     const title = document.getElementById('pageTitle');
     if (title) { title.textContent = views[current][0]; document.getElementById('pageSubtitle').textContent = views[current][1]; document.title=views[current][0]+' · Chispa'; }
     try { sessionStorage.setItem('chispa-view',current); } catch {}
+    requestAnimationFrame(()=>window.scrollTo({top:0,behavior:'instant'}));
   }
   if (sections.length) { selectView(); addEventListener('hashchange',selectView); }
   for (const input of document.querySelectorAll('[data-filter]')) {
@@ -22,6 +23,66 @@
       const empty=document.getElementById(input.dataset.empty); if(empty)empty.hidden=visible>0;
     });
   }
+  const accountRows=[...document.querySelectorAll('.account-row')];
+  let accountPage=0, onlineNames=null;
+  const accountSearch=document.getElementById('accountSearch'), accountState=document.getElementById('accountState'), accountProgram=document.getElementById('accountProgram');
+  function filterAccounts(reset=false){
+    if(!accountSearch)return;
+    if(reset)accountPage=0;
+    const query=accountSearch.value.trim().toLocaleLowerCase(),state=accountState.value,program=accountProgram.value;
+    const matches=accountRows.filter(row=>row.dataset.search.toLocaleLowerCase().includes(query)&&
+      (state==='all'||(state==='online'?onlineNames?.has(row.dataset.username.toLocaleLowerCase()):row.dataset.state===state))&&
+      (program==='all'||row.dataset.programs.split(' ').includes(program)));
+    const pages=Math.max(1,Math.ceil(matches.length/20));accountPage=Math.min(accountPage,pages-1);
+    const visible=new Set(matches.slice(accountPage*20,accountPage*20+20));
+    accountRows.forEach(row=>row.hidden=!visible.has(row));
+    document.getElementById('noAccounts').hidden=matches.length>0;
+    document.getElementById('accountCount').textContent=matches.length+' / '+accountRows.length+' 个账号';
+    const label=document.getElementById('accountPage');if(label)label.textContent=(accountPage+1)+' / '+pages+' 页 · 每页 20 个';
+    const prev=document.getElementById('accountPrev'),next=document.getElementById('accountNext');
+    if(prev)prev.disabled=accountPage===0;if(next)next.disabled=accountPage>=pages-1;
+  }
+  accountSearch?.addEventListener('input',()=>filterAccounts(true));
+  [accountState,accountProgram].forEach(input=>input?.addEventListener('change',()=>filterAccounts(true)));
+  document.getElementById('accountPrev')?.addEventListener('click',()=>{accountPage--;filterAccounts();});
+  document.getElementById('accountNext')?.addEventListener('click',()=>{accountPage++;filterAccounts();});
+  filterAccounts();
+  for(const editor of document.querySelectorAll('.account-row .user-editor')){
+    for(const form of [...editor.children]){
+      const title=form.querySelector('.formhead')?.textContent || (form.classList.contains('deleteform')?'删除账号':'分程序授权');
+      const group=document.createElement('details'),summary=document.createElement('summary');
+      group.className='account-action';summary.textContent=title;form.before(group);group.append(summary,form);
+    }
+  }
+  let onlineBusy=false;
+  async function updateOnline(){
+    if(onlineBusy||!document.getElementById('onlineRows')||document.hidden)return;
+    onlineBusy=true;
+    const status=document.getElementById('onlineStatus');
+    try{
+      const response=await fetch('/admin/online',{credentials:'same-origin',cache:'no-store',signal:AbortSignal.timeout(10000)});
+      if(response.redirected||response.status===401)throw new Error('登录已过期，请重新登录');
+      if(!response.ok)throw new Error('在线状态读取失败');
+      const data=await response.json();onlineNames=new Set(data.programs.map(p=>p.username.toLocaleLowerCase()));
+      document.getElementById('onlineUsers').textContent=data.onlineUsers.toLocaleString();
+      document.getElementById('onlinePrograms').textContent=data.programs.length.toLocaleString();
+      const rows=data.programs.map(p=>{
+        const row=document.createElement('tr');
+        for(const value of [p.username,p.programName+' / '+p.version,p.address||'—',new Date(p.startedAt).toLocaleString(),new Date(p.lastSeen).toLocaleString()]){
+          const cell=document.createElement('td');cell.textContent=value;row.append(cell);
+        }return row;
+      });
+      if(!rows.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=5;cell.textContent='当前没有运行中的程序';row.append(cell);rows.push(row);}
+      document.getElementById('onlineRows').replaceChildren(...rows);
+      accountRows.forEach(row=>{const badge=row.querySelector('[data-presence]'),online=onlineNames.has(row.dataset.username.toLocaleLowerCase());badge.textContent=online?'在线':'离线';badge.classList.toggle('is-online',online);});
+      filterAccounts();status.textContent='已更新 · '+new Date(data.sampledAt).toLocaleTimeString()+' · 每 15 秒刷新';
+    }catch(error){
+      onlineNames=null;status.textContent=error.message+' · 上次数据可能已过期，等待重试';
+      accountRows.forEach(row=>{const badge=row.querySelector('[data-presence]');badge.textContent='未知';badge.classList.remove('is-online');});filterAccounts();
+    }finally{onlineBusy=false;}
+  }
+  document.getElementById('refreshOperations')?.addEventListener('click',()=>{updateOnline();updateMetrics();});
+  updateOnline();setInterval(updateOnline,15000);
   for (const toggle of document.querySelectorAll('[data-reset-toggle]')) {
     const form = toggle.closest('form');
     const fields = form?.querySelector('[data-reset-fields]');
@@ -220,14 +281,22 @@
     });
   }
   const status=document.getElementById('metricsStatus');
-  if(document.getElementById('requests')) {
-    async function updateMetrics(){
-      if(document.hidden)return;
+  let previousMetrics=null,metricsBusy=false;
+  const bytes=value=>{const units=['B','KiB','MiB','GiB','TiB'];let unit=0;while(value>=1024&&unit<units.length-1){value/=1024;unit++;}return value.toLocaleString(undefined,{maximumFractionDigits:unit?2:0})+' '+units[unit];};
+  async function updateMetrics(){
+      if(document.hidden||metricsBusy||!document.getElementById('requests'))return;
+      metricsBusy=true;
       try{
-        const response=await fetch('/admin/metrics',{credentials:'same-origin',cache:'no-store'});
+        const response=await fetch('/admin/metrics',{credentials:'same-origin',cache:'no-store',signal:AbortSignal.timeout(10000)});
         if(response.redirected||response.status===401){if(status)status.textContent='登录已过期，请重新登录';return;}
         if(!response.ok)throw new Error();
         const m=await response.json();
+        document.getElementById('receivedBytes').textContent=bytes(m.receivedBytes);
+        document.getElementById('sentBytes').textContent=bytes(m.sentBytes);
+        const seconds=previousMetrics?(Date.parse(m.sampledAt)-Date.parse(previousMetrics.sampledAt))/1000:0;
+        const sameRun=previousMetrics?.startedAt===m.startedAt;
+        for(const [label,field] of [['receiveRate','receivedBytes'],['sendRate','sentBytes']])document.getElementById(label).textContent=sameRun&&seconds>0?bytes(Math.max(0,m[field]-previousMetrics[field])/seconds)+'/s':'等待下次采样';
+        previousMetrics=m;
         for(const id of ['requests','apiRequests','failedRequests','activeSessions','downloads','loginSuccess','loginFailure','clientProbes'])document.getElementById(id).textContent=m[id].toLocaleString();
         document.getElementById('lastHour').textContent=m.lastHour.reduce((a,b)=>a+b,0).toLocaleString();
         document.getElementById('uptimeMinutes').textContent=Math.floor(m.uptimeSeconds/60)+' 分钟';
@@ -237,9 +306,11 @@
         const max=Math.max(1,...m.lastHour);
         document.getElementById('requestChart').replaceChildren(...m.lastHour.map(value=>{const bar=document.createElement('i');bar.className='bar';bar.title=value+' 次';bar.style.height=Math.max(3,value*100/max)+'%';return bar;}));
         if(status)status.textContent='已更新 · '+new Date().toLocaleTimeString();
-      }catch{if(status)status.textContent='连接中断 · 等待重试';}
+      }catch{if(status)status.textContent='连接中断 · 显示上次采样，等待重试';}
+      finally{metricsBusy=false;}
     }
-    setInterval(updateMetrics,15000);
+  if(document.getElementById('requests')) {
+    updateMetrics();setInterval(updateMetrics,15000);
     document.getElementById('browserProbe').addEventListener('click',async event=>{
       const button=event.currentTarget,label=document.getElementById('browserProbeResult'),start=performance.now();
       button.disabled=true;label.textContent='正在连接…';

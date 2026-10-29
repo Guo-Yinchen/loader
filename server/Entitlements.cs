@@ -2,31 +2,32 @@
 // until the first redemption; conversion is committed with the consumed code in one journal.
 sealed partial class Store
 {
-    private static bool HasActiveSubscription(UserRecord user) => user.ProgramExpiries is { } expiries
-        ? expiries.Values.Any(expiry => expiry is null || expiry > DateTimeOffset.UtcNow)
-        : user.ExpiresAt is null || user.ExpiresAt > DateTimeOffset.UtcNow;
+    private bool HasActiveSubscription(UserRecord user) => Entitlements(user).Values
+        .Any(expiry => expiry is null || expiry > DateTimeOffset.UtcNow) ||
+        (user.ProgramExpiries is null && ListAllPrograms().Count == 0 &&
+         (user.ExpiresAt is null || user.ExpiresAt > DateTimeOffset.UtcNow));
 
     public DateTimeOffset? ProgramExpiry(UserRecord user, string programId)
     {
         var program = GetProgram(programId);
         var scope = program?.IsBeta == true ? program.ParentProgramId ?? programId : programId;
-        return user.ProgramExpiries is { } expiries
-            ? expiries.GetValueOrDefault(scope, DateTimeOffset.MinValue) : user.ExpiresAt;
+        return EffectiveExpiry(user, scope, user.ProgramExpiries is { } expiries
+            ? expiries.GetValueOrDefault(scope, DateTimeOffset.MinValue) : user.ExpiresAt);
     }
 
     private Dictionary<string, DateTimeOffset?> Entitlements(UserRecord user) =>
-        user.ProgramExpiries is { } expiries ? new(expiries, StringComparer.Ordinal) :
+        user.ProgramExpiries is { } expiries ? expiries.ToDictionary(p => p.Key, p => EffectiveExpiry(user, p.Key, p.Value), StringComparer.Ordinal) :
         ListAllPrograms().Where(p => !p.IsBeta && HasProgramScope(user, p.Id))
-            .ToDictionary(p => p.Id, _ => user.ExpiresAt, StringComparer.Ordinal);
+            .ToDictionary(p => p.Id, p => EffectiveExpiry(user, p.Id, user.ExpiresAt), StringComparer.Ordinal);
 
-    private static UserRecord WithEntitlements(UserRecord user, Dictionary<string, DateTimeOffset?> expiries)
+    private UserRecord WithEntitlements(UserRecord user, Dictionary<string, DateTimeOffset?> expiries)
     {
         var ids = expiries.Keys.Order(StringComparer.Ordinal).ToArray();
         // The aggregate deadline is for older clients/account overview only. Authorization
         // always uses the individual program's deadline (including at ticket/heartbeat time).
         var aggregate = expiries.Count == 0 ? DateTimeOffset.MinValue :
             expiries.Values.Any(e => e is null) ? (DateTimeOffset?)null : expiries.Values.Max();
-        return user with { ProgramExpiries = expiries, ProgramIds = ids, ExpiresAt = aggregate,
+        return user with { ProgramExpiries = expiries, ProgramIds = ids, ExpiresAt = aggregate, BillingOffsets = BillingOffsets(ids),
             AccessMode = ids.Length == 0 ? "none" : ids.Length == 1 ? "single" : "multiple" };
     }
 

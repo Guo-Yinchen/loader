@@ -26,6 +26,23 @@ $stage = Join-Path $root ".local/staging/$Version"
 if (Test-Path -LiteralPath $stage) { throw "Staging directory already exists: $stage" }
 if (-not (Test-Path -LiteralPath (Join-Path $source 'Wardogs.exe'))) { throw 'Build Wardogs.exe first.' }
 
+# Require the policy compiled into the artifact, independent of directory/file names.
+# Older artifacts must be rebuilt rather than guessed to be production.
+$artifactBytes = [IO.File]::ReadAllBytes((Join-Path $source 'Wardogs.exe'))
+if (-not [Text.Encoding]::ASCII.GetString($artifactBytes).Contains('chispa-build-policy-v1')) {
+    throw 'This artifact predates compiled build policies. Rebuild with -Flavor Production before publishing.'
+}
+$buildInfoText = & (Join-Path $source 'Wardogs.exe') --build-info
+if ($LASTEXITCODE -ne 0) { throw 'Cannot read the compiled build policy. Rebuild the Production flavor.' }
+try { $buildInfo = ($buildInfoText -join "`n") | ConvertFrom-Json }
+catch { throw 'Missing or invalid compiled build policy. Rebuild with -Flavor Production.' }
+if ($buildInfo.policy -cne 'chispa-build-policy-v1' -or
+    $buildInfo.flavor -cne 'Production' -or $buildInfo.configuration -cne 'Release' -or
+    $buildInfo.licenseRequired -ne $true -or
+    $buildInfo.diagnostics -ne $false) {
+    throw 'Publishing refused: only a licensed Production build with developer diagnostics disabled may be distributed.'
+}
+
 # The published version and the version compiled into the EXE have to be the same string: the
 # launch lease the program receives names one version, and the program compares it with its own
 # stamp. Publishing 1.2.3 from a build stamped 1.2.2 produces a package that downloads, installs

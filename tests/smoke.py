@@ -301,6 +301,7 @@ def main():
             with browser.open(base + "/admin") as response:
                 assert response.url.startswith(base + "/admin/login")
             env["CHISPA_INSTALL_ROOT"] = str(temp / "installed")
+            env["CHISPA_CONFIG_DIRECTORY"] = str(temp / "settings")
             env["CHISPA_CREDENTIAL_FILE"] = str(temp / "credentials.json")
             client = subprocess.run([str(DOTNET), str(CLIENT_SMOKE), base],
                                     **{**kwargs, "env": env, "check": False})

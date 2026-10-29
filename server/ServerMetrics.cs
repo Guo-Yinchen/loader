@@ -11,6 +11,10 @@ sealed class ServerMetrics
     private long loginFailure;
     private long downloads;
     private long clientProbes;
+    private long receivedBytes;
+    private long sentBytes;
+    public void Receive(int count) => Interlocked.Add(ref receivedBytes, count);
+    public void Send(int count) => Interlocked.Add(ref sentBytes, count);
     private readonly object probeGate = new();
     private DateTimeOffset? lastClientProbeAt;
     private string? lastClientProbeAddress;
@@ -60,11 +64,13 @@ sealed class ServerMetrics
             Interlocked.Read(ref apiRequests), Interlocked.Read(ref failedRequests),
             Interlocked.Read(ref loginSuccess), Interlocked.Read(ref loginFailure),
             Interlocked.Read(ref downloads), activeSessions, process.WorkingSet64, history,
-            Interlocked.Read(ref clientProbes), probeAt, probeAddress);
+            Interlocked.Read(ref clientProbes), probeAt, probeAddress,
+            Interlocked.Read(ref receivedBytes), Interlocked.Read(ref sentBytes), DateTimeOffset.UtcNow);
     }
 }
 
 record MetricsSnapshot(DateTimeOffset StartedAt, long UptimeSeconds, long Requests, long ApiRequests,
     long FailedRequests, long LoginSuccess, long LoginFailure, long Downloads,
     int ActiveSessions, long MemoryBytes, long[] LastHour, long ClientProbes,
-    DateTimeOffset? LastClientProbeAt, string? LastClientProbeAddress);
+    DateTimeOffset? LastClientProbeAt, string? LastClientProbeAddress,
+    long ReceivedBytes, long SentBytes, DateTimeOffset SampledAt);

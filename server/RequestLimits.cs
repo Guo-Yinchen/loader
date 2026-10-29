@@ -65,6 +65,8 @@ sealed class RequestLimits
         var bodyFeature = context.Features.Get<IHttpMaxRequestBodySizeFeature>();
         if (bodyFeature is { IsReadOnly: false } && !path.StartsWithSegments("/admin/releases"))
             bodyFeature.MaxRequestBodySize = 512 * 1024;
+        if (path == "/api/v1/diagnostics" && bodyFeature is { IsReadOnly: false })
+            bodyFeature.MaxRequestBodySize = 128 * 1024;
         if (path.StartsWithSegments("/api/v1/session") || path.StartsWithSegments("/api/v1/register") ||
             path.StartsWithSegments("/api/v1/activation") || path.StartsWithSegments("/admin/login"))
         {

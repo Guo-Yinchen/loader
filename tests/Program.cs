@@ -12,6 +12,12 @@ var trustKeys = Environment.GetEnvironmentVariable("CHISPA_TRUST_KEYS") is { Len
     ? ReleaseTrustFile.Load(trustKeyPath)
     : ReleaseTrust.Keys;
 
+if (args.Length == 1 && args[0] == "--install-storage-check")
+{
+    InstallStorageChecks.Run();
+    return 0;
+}
+
 // White-box check of the client-side rules against a manifest supplied as a file. The end-to-end
 // scenarios drive tampering through the server; this one feeds the installer manifests it would
 // never receive from a working server (a valid signature over a different program, a substituted

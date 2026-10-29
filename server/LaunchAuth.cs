@@ -194,7 +194,7 @@ sealed class LaunchGate
             var leaseToken = Token();
             if (leases.Count >= MaxEntries) Sweep(force: true);
             var lease = new LeaseRecord(leaseToken, ticket.Username, ticket.UserHash, ticket.SessionId,
-                request.ProgramId, request.Version, request.Device!, now, LeaseDeadline(now, store.ProgramExpiry(user, request.ProgramId)));
+                request.ProgramId, request.Version, request.Device!, now, LeaseDeadline(now, store.ProgramExpiry(user, request.ProgramId)), RemoteAddress: remote);
             leases[leaseToken] = lease;
             failures.TryRemove(FailureKey(remote), out _);
             logger.LogInformation("launch lease issued account={Account} program={Program} version={Version} device={Device} remote={Remote}",
@@ -206,6 +206,23 @@ sealed class LaunchGate
     }
 
     public int Api => 1;
+
+    public IReadOnlyList<OnlineProgram> OnlinePrograms()
+    {
+        lock (stateGate)
+        {
+            var now = DateTimeOffset.UtcNow;
+            return leases.Values.Where(lease => lease.RevokedReason is null && lease.ExpiresAt > now &&
+                    (lease.LastSeen ?? lease.IssuedAt) > now.AddSeconds(-(HeartbeatSeconds * 2 + 15)))
+                .Where(lease => store.CurrentUser(lease.Username, lease.UserHash) is { } user &&
+                    store.CanAccess(user, lease.ProgramId) &&
+                    store.GetRelease(lease.ProgramId, lease.Version) is { Status: not ReleaseStatus.Banned })
+                .Select(lease => new OnlineProgram(lease.Username, lease.ProgramId,
+                    store.FindProgram(lease.ProgramId)?.Name ?? lease.ProgramId, lease.Version,
+                    lease.RemoteAddress, lease.IssuedAt, lease.LastSeen ?? lease.IssuedAt, lease.ExpiresAt))
+                .OrderByDescending(lease => lease.LastSeen).ToArray();
+        }
+    }
 
     // ---- heartbeat ------------------------------------------------------------------------
     // The only place a running program re-earns the right to keep running. Every reason an
@@ -256,6 +273,22 @@ sealed class LaunchGate
             return (StatusCodes.Status200OK, new LeaseRenewed(true, extended.ExpiresAt, now, HeartbeatSeconds, LeaseSeconds,
                 store.ProgramExpiry(user, lease.ProgramId)));
 
+        }
+    }
+
+    // Checks the existing lease without renewing it: reports cannot extend authorisation.
+    public DiagnosticOwner? DiagnosticIdentity(string? bearer, string? device)
+    {
+        lock (stateGate)
+        {
+            if (string.IsNullOrEmpty(bearer) || !leases.TryGetValue(bearer, out var lease) ||
+                lease.RevokedReason is not null || lease.ExpiresAt <= DateTimeOffset.UtcNow ||
+                !string.Equals(device, lease.Device, StringComparison.Ordinal)) return null;
+            var user = store.CurrentUser(lease.Username, lease.UserHash);
+            if (user is null || !store.CanAccess(user, lease.ProgramId)) return null;
+            var release = store.GetRelease(lease.ProgramId, lease.Version);
+            return release is null || release.Status == ReleaseStatus.Banned ? null :
+                new DiagnosticOwner(lease.Username, lease.ProgramId, lease.Version);
         }
     }
 
@@ -351,5 +384,7 @@ sealed record TicketRecord(string Username, string UserHash, string SessionId, s
     string Version, DateTimeOffset ExpiresAt, int Attempts);
 sealed record LeaseRecord(string Token, string Username, string UserHash, string SessionId,
     string ProgramId, string Version, string Device, DateTimeOffset IssuedAt, DateTimeOffset ExpiresAt,
-    string? RevokedReason = null, DateTimeOffset? LastSeen = null);
+    string? RevokedReason = null, DateTimeOffset? LastSeen = null, string? RemoteAddress = null);
+sealed record OnlineProgram(string Username, string ProgramId, string ProgramName, string Version,
+    string? Address, DateTimeOffset StartedAt, DateTimeOffset LastSeen, DateTimeOffset ExpiresAt);
 sealed record FailureWindow(int Count, DateTimeOffset Until);

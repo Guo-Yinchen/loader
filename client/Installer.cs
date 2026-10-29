@@ -49,7 +49,7 @@ internal sealed class Installer
     public async Task InstallAsync(LauncherApi api, ProgramInfo program, Release release, IProgress<int>? progress, CancellationToken cancellationToken)
     {
         Validate(program, release);
-        if (!Version.TryParse(release.Version, out _) || release.Size <= 0 || release.Size > 2L * 1024 * 1024 * 1024)
+        if (!IsVersion(release.Version) || release.Size <= 0 || release.Size > 2L * 1024 * 1024 * 1024)
             throw new InvalidDataException("Invalid release manifest.");
         // Before a single byte is downloaded: is this manifest what the release environment signed?
         // Doing it first also means the SHA-256 the download will be compared against is the signed
@@ -57,6 +57,7 @@ internal sealed class Installer
         VerifySignature(release);
         var programRoot = ProgramRoot(program.Id);
         var versions = Path.Combine(programRoot, "versions");
+        AssertPlainTree(programRoot, inspectChildren: false);
         Directory.CreateDirectory(versions);
         // One installer per program directory. Starting the loader twice (easy: double-click) must
         // not have two downloads and two directory moves racing over the same version folder.
@@ -72,8 +73,9 @@ internal sealed class Installer
         }
         using (installLock)
         {
+            EnsureNotRunning(programRoot, program.Executable);
+            RecoverInterruptedReplacement(versions);
             DeleteStaleStages(versions);
-            var destination = Path.Combine(versions, release.Version);
             // The signed package identity stays stable across retries and app restarts.
             var tempZip = Path.Combine(programRoot, "download-" + release.Version + "-" +
                 release.Sha256.ToLowerInvariant() + ".zip");
@@ -119,30 +121,163 @@ internal sealed class Installer
                     throw new InvalidDataException($"Package is missing {program.Executable}.");
 
                 File.WriteAllText(Path.Combine(stage, ".package.sha256"), release.Sha256);
-                string? backup = null;
-                if (Directory.Exists(destination))
-                {
-                    // Re-download for repairs. Preserve the old directory so runtime
-                    // settings can be recovered; never silently trust a local marker.
-                    var backups = Path.Combine(programRoot, "backups");
-                    Directory.CreateDirectory(backups);
-                    backup = Path.Combine(backups, release.Version + "-" + Guid.NewGuid().ToString("N"));
-                    Directory.Move(destination, backup);
-                }
-                try { Directory.Move(stage, destination); }
-                catch
-                {
-                    if (backup is not null) Directory.Move(backup, destination);
-                    throw;
-                }
-                PointTo(programRoot, release.Version);
+                ActivatePackage(program, release.Version, stage);
             }
             finally
             {
                 if (File.Exists(tempZip)) File.Delete(tempZip);
-                if (Directory.Exists(stage)) Directory.Delete(stage, recursive: true);
+                if (Directory.Exists(stage)) DeleteOwnedDirectory(stage, versions);
             }
         }
+    }
+
+    // Called only after signed-package validation/extraction. Tests exercise this filesystem
+    // transaction directly, including a pointer write failure; it is not a launcher command.
+    internal void ActivatePackage(ProgramInfo program, string version, string stage)
+    {
+        LauncherApi.ValidateProgram(program);
+        if (!IsVersion(version)) throw new InvalidDataException("Invalid install version.");
+        var programRoot = ProgramRoot(program.Id);
+        var versions = Path.Combine(programRoot, "versions");
+        AssertOwnedChild(stage, versions);
+        if (!System.Text.RegularExpressions.Regex.IsMatch(Path.GetFileName(stage), "^\\.stage-[a-f0-9]{32}\\z")
+            || !File.Exists(Path.Combine(stage, program.Executable)))
+            throw new InvalidDataException("Invalid install staging directory.");
+        AssertPlainTree(stage);
+        EnsureNotRunning(programRoot, program.Executable);
+        var destination = Path.Combine(versions, version);
+        if (program.Executable.Equals("Wardogs.exe", StringComparison.OrdinalIgnoreCase))
+        {
+            var candidates = new List<string>();
+            if (InstalledVersion(program) is { } current) candidates.Add(Path.Combine(versions, current));
+            candidates.Add(destination);
+            candidates.AddRange(Directory.EnumerateDirectories(versions).Where(p => IsVersion(Path.GetFileName(p)))
+                .OrderByDescending(Directory.GetLastWriteTimeUtc));
+            var backups = Path.Combine(programRoot, "backups");
+            if (Directory.Exists(backups))
+                candidates.AddRange(Directory.EnumerateDirectories(backups).Where(IsOldBackup)
+                    .OrderByDescending(Directory.GetLastWriteTimeUtc));
+            // This must finish before deleting or moving any legacy configuration source.
+            WardogsSettings.Migrate(candidates);
+        }
+        string? replaced = null;
+        var movedNew = false;
+        try
+        {
+            if (Directory.Exists(destination))
+            {
+                AssertPlainTree(destination);
+                replaced = Path.Combine(versions, ".replace-" + version + "-" + Guid.NewGuid().ToString("N"));
+                Directory.Move(destination, replaced);
+            }
+            Directory.Move(stage, destination);
+            movedNew = true;
+            PointTo(programRoot, version);
+        }
+        catch
+        {
+            if (movedNew) DeleteOwnedDirectory(destination, versions);
+            if (replaced is not null) Directory.Move(replaced, destination);
+            throw;
+        }
+        // There is no persistent rollback archive. Keep only the activated version, and
+        // retire old backup folders created by earlier loaders after settings are safe.
+        try { PruneInstalledVersions(programRoot, version); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new IOException("新版本已安装，但旧程序目录清理失败；请关闭程序并检查目录权限后重新安装。", ex);
+        }
+    }
+
+    private static bool IsVersion(string name) =>
+        System.Text.RegularExpressions.Regex.IsMatch(name, "^[0-9]+\\.[0-9]+\\.[0-9]+\\z") && Version.TryParse(name, out _);
+
+    private static bool IsOldBackup(string path) => System.Text.RegularExpressions.Regex.IsMatch(
+        Path.GetFileName(path), "^[0-9]+\\.[0-9]+\\.[0-9]+-[a-f0-9]{32}\\z", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    private static bool IsReplacement(string path) => System.Text.RegularExpressions.Regex.IsMatch(
+        Path.GetFileName(path), "^\\.replace-[0-9]+\\.[0-9]+\\.[0-9]+-[a-f0-9]{32}\\z");
+
+    internal static void RecoverInterruptedReplacement(string versions)
+    {
+        AssertPlainTree(versions, inspectChildren: false);
+        foreach (var path in Directory.EnumerateDirectories(versions).Where(IsReplacement)
+            .OrderByDescending(Directory.GetLastWriteTimeUtc))
+        {
+            var name = Path.GetFileName(path);
+            var version = name[9..name.LastIndexOf('-')];
+            if (!IsVersion(version)) continue;
+            var destination = Path.Combine(versions, version);
+            if (Directory.Exists(destination)) continue;
+            AssertPlainTree(path);
+            Directory.Move(path, destination);
+        }
+    }
+
+    private static void PruneInstalledVersions(string programRoot, string current)
+    {
+        var versions = Path.Combine(programRoot, "versions");
+        foreach (var directory in Directory.EnumerateDirectories(versions))
+            if ((IsVersion(Path.GetFileName(directory)) && !Path.GetFileName(directory).Equals(current, StringComparison.OrdinalIgnoreCase))
+                || IsReplacement(directory)) DeleteOwnedDirectory(directory, versions);
+        var backups = Path.Combine(programRoot, "backups");
+        if (!Directory.Exists(backups)) return;
+        AssertPlainTree(backups, inspectChildren: false);
+        foreach (var directory in Directory.EnumerateDirectories(backups).Where(IsOldBackup))
+            DeleteOwnedDirectory(directory, backups);
+        if (!Directory.EnumerateFileSystemEntries(backups).Any()) Directory.Delete(backups);
+    }
+
+    private static void EnsureNotRunning(string programRoot, string executable)
+    {
+        var prefix = Path.GetFullPath(programRoot).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        foreach (var process in Process.GetProcessesByName(Path.GetFileNameWithoutExtension(executable)))
+        {
+            using (process)
+            {
+                try
+                {
+                    if (process.MainModule?.FileName is { } path && Path.GetFullPath(path).StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                        throw new IOException("请先关闭正在运行的主程序，再下载或更新。");
+                }
+                catch (System.ComponentModel.Win32Exception)
+                {
+                    if (!process.HasExited) throw new IOException("无法确认主程序是否仍在运行，请关闭它后再更新。");
+                }
+                catch (InvalidOperationException) { /* Process exited during inspection. */ }
+            }
+        }
+    }
+
+    internal static void AssertPlainTree(string path, bool inspectChildren = true)
+    {
+        for (var parent = new DirectoryInfo(Path.GetFullPath(path)); parent is not null; parent = parent.Parent)
+            if (parent.Exists && (parent.Attributes & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("程序或配置目录包含链接，已停止文件操作。");
+        if (!inspectChildren || !Directory.Exists(path)) return;
+        var pending = new Stack<string>();pending.Push(path);
+        while (pending.TryPop(out var folder))
+            foreach (var entry in Directory.EnumerateFileSystemEntries(folder))
+            {
+                var attributes = File.GetAttributes(entry);
+                if ((attributes & FileAttributes.ReparsePoint) != 0)
+                    throw new IOException("目录包含链接，已停止清理。");
+                if ((attributes & FileAttributes.Directory) != 0) pending.Push(entry);
+            }
+    }
+
+    private static void AssertOwnedChild(string directory, string parent)
+    {
+        if (!string.Equals(Path.GetDirectoryName(Path.GetFullPath(directory)), Path.GetFullPath(parent).TrimEnd(Path.DirectorySeparatorChar),
+            StringComparison.OrdinalIgnoreCase)) throw new IOException("拒绝操作安装目录之外的路径。");
+        AssertPlainTree(parent, inspectChildren: false);
+    }
+
+    private static void DeleteOwnedDirectory(string directory, string parent)
+    {
+        AssertOwnedChild(directory, parent);
+        AssertPlainTree(directory);
+        Directory.Delete(directory, recursive: true);
     }
 
     /// <summary>Removes staging directories left behind by a crashed or killed install. Only
@@ -154,9 +289,10 @@ internal sealed class Installer
         {
             foreach (var directory in Directory.EnumerateDirectories(versions, ".stage-*"))
             {
+                if (!System.Text.RegularExpressions.Regex.IsMatch(Path.GetFileName(directory), "^\\.stage-[a-f0-9]{32}$")) continue;
                 var info = new DirectoryInfo(directory);
                 if (DateTime.UtcNow - info.LastWriteTimeUtc < TimeSpan.FromHours(1)) continue;
-                info.Delete(recursive: true);
+                DeleteOwnedDirectory(directory, versions);
             }
         }
         catch (IOException) { }

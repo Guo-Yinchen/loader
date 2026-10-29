@@ -106,6 +106,7 @@ static partial class AdminPages
                     <a href='#programs'><span class='nav-icon' aria-hidden='true'>◇</span>程序管理</a>
                     <a href='#release'><span class='nav-icon' aria-hidden='true'>↑</span>版本发布</a>
                     <a href='#connectivity'><span class='nav-icon' aria-hidden='true'>⌁</span>连接诊断</a>
+                    <a href='/admin/diagnostics'><span class='nav-icon' aria-hidden='true'>≡</span>输入故障报告</a>
                   </nav>
                   <div class='sidebar-footer'><p><span class='server-light'></span>Chispa 分发服务</p><form method='post' action='/admin/logout'>
                 """).Append(Csrf(token)).Append("""
@@ -119,6 +120,7 @@ static partial class AdminPages
             {
                 "created" => "账号已创建。",
                 "updated" => "已保存。",
+                "compensated" => "补偿完成，已更新 " + (int.TryParse(context.Request.Query["count"], out var compensated) ? compensated : 0) + " 个账号。",
                 "password" => "密码已更新，该账号的旧登录会话已失效。",
                 "deleted" => "账号已删除。",
                 "program" => "程序信息已保存。",
@@ -131,7 +133,8 @@ static partial class AdminPages
             if (noticeText is not null) body.Append("<p class='notice'>").Append(Encode(noticeText)).Append("</p>");
             var error = context.Request.Query["error"].ToString();
             if (error.Length > 0) body.Append("<p class='error'>").Append(Encode(error)).Append("</p>");
-            body.Append("<section id='overview' data-view='overview' class='card'><div class='sectionhead'><h2>实时运行状态</h2><span class='online'>● 运行中</span></div>")
+            body.Append(OperationsSection());
+            body.Append("<section data-view='overview' class='card'><div class='sectionhead'><h2>实时运行状态</h2><span class='online'>● 运行中</span></div>")
                 .Append("<p class='hint'>自 ").Append(Encode(stats.StartedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")))
                 .Append(" 启动 · ").Append(Encode(context.Request.Scheme + "://" + context.Request.Host))
                 .Append(" · 统计随服务重启清零</p><div class='statgrid'>");
@@ -139,7 +142,7 @@ static partial class AdminPages
             Metric(body, "最近 1 小时", stats.LastHour.Sum(), "lastHour");
             Metric(body, "API 请求", stats.ApiRequests, "apiRequests");
             Metric(body, "失败响应", stats.FailedRequests, "failedRequests");
-            Metric(body, "当前会话", stats.ActiveSessions, "activeSessions");
+            Metric(body, "有效登录会话", stats.ActiveSessions, "activeSessions");
             Metric(body, "下载请求", stats.Downloads, "downloads");
             body.Append("</div><div class='minirow'><span>运行 <b id='uptimeMinutes'>")
                 .Append(stats.UptimeSeconds / 60).Append(" 分钟</b></span><span>客户端登录成功 <b id='loginSuccess'>")
@@ -178,8 +181,11 @@ static partial class AdminPages
                 </div><label class='check'><input type='checkbox' name='betaAccess' value='1'>允许访问 Beta 程序</label>
                 <p class='hint'>Beta 权限可与任一账号分类并行。全部程序默认只包含稳定程序；到期时间按服务器本地时间填写，精确到分钟，留空表示永久。</p>
                 <button>创建账号</button></form></details></section>
-                <section data-view='accounts' class='card'><div class='sectionhead'><h2>现有账号</h2><input class='list-search' type='search' aria-label='搜索账号' placeholder='搜索账号或权限…' data-filter='.user' data-empty='noAccounts'></div>
+                <section data-view='accounts' class='card'><div class='sectionhead'><h2>现有账号</h2><input class='list-search' type='search' aria-label='搜索账号' placeholder='搜索账号或权限…' id='accountSearch'></div>
                 """).Append(ZoneHint()).Append("""
+                <div class='account-toolbar'><label>授权状态<select id='accountState'><option value='all'>全部状态</option><option value='active'>有效授权</option><option value='expired'>已到期</option><option value='none'>未授权</option><option value='online'>程序在线</option></select></label><label>程序<select id='accountProgram'><option value='all'>全部程序</option>
+                """).Append(string.Join("", programs.Where(p => !p.IsBeta).Select(p => "<option value='" + Encode(p.Id) + "'>" + Encode(p.Name) + "</option>"))).Append("""
+                </select></label><span id='accountCount' role='status'></span></div>
                 <p class='empty-state' id='noAccounts' hidden>没有匹配的账号。</p>
                 """);
             if (users.Count == 0) body.Append("<p class='empty-state'>还没有账号，点击上方“创建账号”开始。</p>");
@@ -192,8 +198,11 @@ static partial class AdminPages
                     var state = user.ProgramExpiries?.Count == 0 ? "尚未开通稳定程序" : user.ExpiresAt is null ? "含永久授权"
                         : user.ExpiresAt <= DateTimeOffset.UtcNow ? "已到期 " + LocalText(user.ExpiresAt.Value)
                         : "最晚有效期至 " + LocalText(user.ExpiresAt.Value);
-                    body.Append("<details class='user' data-search='").Append(Encode(user.Username + " " + AccessLabel(user, programs))).Append("'><summary class='userhead'><strong>").Append(Encode(user.Username))
-                        .Append("</strong><span>").Append(Encode(state)).Append("</span><span class='badge'>")
+                    body.Append("<details class='user account-row' data-username='").Append(Encode(user.Username))
+                        .Append("' data-programs='").Append(Encode(string.Join(" ", user.ProgramExpiries?.Keys ?? Enumerable.Empty<string>())))
+                        .Append("' data-state='").Append(user.ProgramExpiries?.Count == 0 ? "none" : user.ExpiresAt is null || user.ExpiresAt > DateTimeOffset.UtcNow ? "active" : "expired")
+                        .Append("' data-search='").Append(Encode(user.Username + " " + AccessLabel(user, programs))).Append("'><summary class='userhead'><strong>").Append(Encode(user.Username))
+                        .Append("</strong><span class='presence' data-presence>待检测</span><span>").Append(Encode(state)).Append("</span><span class='badge'>")
                         .Append(Encode(AccessLabel(user, programs))).Append("</span><span class='edit-affordance'>管理账号 ⌄</span></summary><div class='user-editor'>")
                         .Append(ProgramExpiryForms(user, programs, token))
                         .Append("<form class='expiryform' method='post' action='/admin/users/").Append(path).Append("/expiry'>")
@@ -233,7 +242,7 @@ static partial class AdminPages
                         .Append("/delete' data-confirm='确定删除该账号？删除后其登录会话立即失效。'>")
                         .Append(Csrf(token)).Append("<button class='danger'>删除账号</button></form></div></details>");
                 }
-                body.Append("</div>");
+                body.Append("</div><div class='pager'><button type='button' class='secondary' id='accountPrev'>上一页</button><span id='accountPage'></span><button type='button' class='secondary' id='accountNext'>下一页</button></div>");
             }
             body.Append("</section>");
             body.Append("""
@@ -264,6 +273,7 @@ static partial class AdminPages
                     .Append(Encode(program.Id)).Append(" · ").Append(Encode(program.Executable)).Append(" · ")
                     .Append(release is null ? "占位，未发布" : "最新版本 " + Encode(release.Version))
                     .Append(program.IsBeta ? " · Beta" : "").Append("</span></div><span class='edit-affordance'>编辑选项 ⌄</span></summary>")
+                    .Append(BillingControls(program, token))
                     .Append("<form method='post' enctype='multipart/form-data' action='/admin/programs/")
                     .Append(Uri.EscapeDataString(program.Id)).Append("/update'>").Append(Csrf(token))
                     .Append("<div class='fields'><label>选项名称<input name='name' required maxlength='80' value='")
@@ -834,7 +844,7 @@ static partial class AdminPages
     private static string ProgramExpiryForms(UserSummary user, IReadOnlyList<ProgramInfo> programs, string token)
     {
         if (user.ProgramExpiries is null) return "";
-        var body = new StringBuilder("<p class='formhead'>各程序有效期（Beta 跟随对应稳定程序）</p>");
+        var body = new StringBuilder("<div class='program-expiries'><p class='formhead'>各程序有效期（Beta 跟随对应稳定程序）</p>");
         foreach (var (id, expiry) in user.ProgramExpiries.OrderBy(p => p.Key))
             body.Append("<form method='post' action='/admin/users/").Append(Uri.EscapeDataString(user.Username))
                 .Append("/programs/").Append(Uri.EscapeDataString(id)).Append("/expiry' class='inlineform'>")
@@ -842,7 +852,7 @@ static partial class AdminPages
                 .Append("<input name='expiry' type='datetime-local' step='60' value='").Append(Encode(InputText(expiry)))
                 .Append("'></label><span class='hint'>").Append(Encode(expiry is { } end ? LocalText(end) : "永久"))
                 .Append("</span><button class='secondary'>保存此程序时间</button></form>");
-        return body.ToString();
+        return body.Append("</div>").ToString();
     }
 
     private static string ExpiryHint(UserSummary user)

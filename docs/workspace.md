@@ -1,8 +1,12 @@
 # 工作区与发布入口
 
+新话题先读仓库根目录的 [AGENTS.md](../AGENTS.md)。主程序按相邻仓库的 [维护流程](../../wardogs%20chispa/docs/MAINTENANCE-WORKFLOW.md) 执行，包含开始检查、固定构建、验证清理、版本保留及交付记录。
+
 ## 当前成品
 
 1.0.5 的分程序激活累加、Beta 通行证与旧版本删除规则见 [授权与版本维护](entitlements-and-version-deletion.md)。
+
+未发布的配置迁移与旧主程序清理规则见 [配置与主程序更新](settings-and-updates.md)。loader 本地验证版固定在 `.local/maintenance-check/client/Chispa.Launcher.exe`，不覆盖下表中的已发布成品。
 
 | 组件 | 版本 | 本地位置 | GitHub |
 |---|---|---|---|
